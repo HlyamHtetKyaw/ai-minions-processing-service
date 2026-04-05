@@ -1,4 +1,4 @@
-package com.aiminions.processingservice.transcribe;
+package com.aiminions.processingservice.integration;
 
 import java.util.LinkedHashMap;
 import java.util.Map;

@@ -1,10 +1,7 @@
-package com.aiminions.processingservice.transcribe;
+package com.aiminions.processingservice.jobs.transcribe;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 
-/**
- * Mirrors main-service {@code TranscribeJobMessage} JSON published to {@code ai-minions:jobs:transcribe}.
- */
 public record TranscribeJobMessage(
 		@JsonProperty("jobId") Long jobId,
 		@JsonProperty("userId") Long userId,

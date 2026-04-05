@@ -1,4 +1,4 @@
-package com.aiminions.processingservice.transcribe;
+package com.aiminions.processingservice.subscription.transcribe;
 
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.data.redis.listener.ChannelTopic;
@@ -15,16 +15,16 @@ import lombok.extern.slf4j.Slf4j;
 @ConditionalOnBean(RedisMessageListenerContainer.class)
 @RequiredArgsConstructor
 @Slf4j
-public class TranscribeRedisSubscription {
+public class TranscribeJobRedisSubscription {
 
 	private final RedisMessageListenerContainer redisMessageListenerContainer;
-	private final TranscribeJobListener transcribeJobListener;
+	private final TranscribeJobRedisListener transcribeJobRedisListener;
 	private final ProcessingProperties processingProperties;
 
 	@PostConstruct
 	void subscribe() {
 		String channel = processingProperties.getRedisJobChannel();
-		redisMessageListenerContainer.addMessageListener(transcribeJobListener, new ChannelTopic(channel));
+		redisMessageListenerContainer.addMessageListener(transcribeJobRedisListener, new ChannelTopic(channel));
 		log.info("Subscribed to Redis channel {}", channel);
 	}
 }

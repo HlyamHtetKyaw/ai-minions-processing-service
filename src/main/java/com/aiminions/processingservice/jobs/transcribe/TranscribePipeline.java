@@ -1,4 +1,4 @@
-package com.aiminions.processingservice.transcribe;
+package com.aiminions.processingservice.jobs.transcribe;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -9,7 +9,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.FileSystemUtils;
 
 import com.aiminions.processingservice.config.ProcessingProperties;
-import com.aiminions.processingservice.ffmpeg.FfmpegRunner;
+import com.aiminions.processingservice.integration.AiFeatureServiceClient;
+import com.aiminions.processingservice.integration.MainServiceWorkerClient;
+import com.aiminions.processingservice.media.ffmpeg.FfmpegRunner;
 import com.aiminions.processingservice.storage.ObjectStorageTransferService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -84,7 +86,6 @@ public class TranscribePipeline {
 			byte[] cleanedWav = Files.readAllBytes(cleaned);
 			JsonNode aiData = aiFeatureServiceClient.requestTranscriptionWithAudio(jobId, cleanedWav);
 
-			// Persist only what the user should see: transcribe + AI output (input stays on ai_generations.input_data)
 			ObjectNode outputDataNode = objectMapper.createObjectNode();
 			outputDataNode.put("type", "transcribe");
 			outputDataNode.set("result", aiData.get("result"));
@@ -99,7 +100,6 @@ public class TranscribePipeline {
 
 			String outputData = objectMapper.writeValueAsString(outputDataNode);
 
-			// Redis first so SSE clients get the result even if the HTTP callback fails or is skipped (no worker token).
 			generationStatusPublisher.publishCompleted(jobId, outputData);
 			mainServiceWorkerClient.notifyCompletion(jobId, "completed", null, outputData);
 			log.info("Transcribe job {} completed (transcript length {})", jobId, transcriptText.length());

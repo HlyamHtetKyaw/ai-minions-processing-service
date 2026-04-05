@@ -26,8 +26,6 @@ public class ProcessingProperties {
 
 	private String aiServiceBaseUrl = "http://localhost:8080";
 
-	private String aiServiceWorkerToken = "";
-
 	public String generationStatusChannel(long jobId) {
 		return generationStatusChannelPrefix + jobId;
 	}

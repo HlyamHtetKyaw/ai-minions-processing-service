@@ -1,4 +1,4 @@
-package com.aiminions.processingservice.transcribe;
+package com.aiminions.processingservice.jobs.transcribe;
 
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;

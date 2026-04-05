@@ -1,4 +1,4 @@
-package com.aiminions.processingservice.transcribe;
+package com.aiminions.processingservice.integration;
 
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpEntity;
@@ -23,7 +23,6 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public class AiFeatureServiceClient {
 
-	private static final String WORKER_TOKEN_HEADER = "X-Worker-Token";
 	private static final String GENERATE_PATH = "/ai_service/api/v1/feature/generate";
 
 	private final ProcessingProperties processingProperties;
@@ -38,9 +37,6 @@ public class AiFeatureServiceClient {
 				.build();
 	}
 
-	/**
-	 * Sends cleaned audio as multipart (request JSON + audio bytes). No presigned URL or extra S3 object.
-	 */
 	public JsonNode requestTranscriptionWithAudio(long generationId, byte[] audioWav) throws JsonProcessingException {
 		ObjectNode payload = objectMapper.createObjectNode();
 		payload.put("operation", "transcribe");
@@ -63,24 +59,12 @@ public class AiFeatureServiceClient {
 			}
 		}, MediaType.parseMediaType("audio/wav"));
 
-		String token = processingProperties.getAiServiceWorkerToken();
-		String raw;
-		if (token != null && !token.isBlank()) {
-			raw = restClient.post()
-					.uri(GENERATE_PATH)
-					.contentType(MediaType.MULTIPART_FORM_DATA)
-					.header(WORKER_TOKEN_HEADER, token.trim())
-					.body(mb.build())
-					.retrieve()
-					.body(String.class);
-		} else {
-			raw = restClient.post()
-					.uri(GENERATE_PATH)
-					.contentType(MediaType.MULTIPART_FORM_DATA)
-					.body(mb.build())
-					.retrieve()
-					.body(String.class);
-		}
+		String raw = restClient.post()
+				.uri(GENERATE_PATH)
+				.contentType(MediaType.MULTIPART_FORM_DATA)
+				.body(mb.build())
+				.retrieve()
+				.body(String.class);
 		if (raw == null || raw.isBlank()) {
 			throw new IllegalStateException("Empty response from AI service");
 		}

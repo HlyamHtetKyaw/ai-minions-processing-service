@@ -1,4 +1,4 @@
-package com.aiminions.processingservice.ffmpeg;
+package com.aiminions.processingservice.media.ffmpeg;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
