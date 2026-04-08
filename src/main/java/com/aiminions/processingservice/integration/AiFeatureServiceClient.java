@@ -43,7 +43,7 @@ public class AiFeatureServiceClient {
 		payload.put("generationId", generationId);
 
 		ObjectNode requestRoot = objectMapper.createObjectNode();
-		requestRoot.put("featureType", "AUDIO");
+		requestRoot.put("featureType", "TRANSCRIBE");
 		requestRoot.put("provider", "GEMINI");
 		requestRoot.set("payload", payload);
 		String requestJson = objectMapper.writeValueAsString(requestRoot);
