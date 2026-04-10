@@ -29,6 +29,8 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3Configuration;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.core.sync.RequestBody;
 
 @Service
 @RequiredArgsConstructor
@@ -39,6 +41,7 @@ public class ObjectStorageTransferService {
 			.connectTimeout(Duration.ofSeconds(30))
 			.followRedirects(HttpClient.Redirect.NORMAL)
 			.build();
+	private static final String DEFAULT_IMAGE_PREFIX = "content-generator/v2";
 
 	private final WorkerStorageProperties props;
 
@@ -192,5 +195,51 @@ public class ObjectStorageTransferService {
 	private static String sanitizeLocalName(String name) {
 		String n = name.replace("\\", "_").replace("/", "_");
 		return n.isBlank() ? "download.bin" : n;
+	}
+
+	public StoredObject uploadPng(byte[] bytes, String keyHint) {
+		if (bytes == null || bytes.length == 0) {
+			throw new IllegalArgumentException("image bytes must not be empty");
+		}
+		String key = buildKey(keyHint);
+		if (props.getProvider() == WorkerStorageProperties.Provider.GCP) {
+			ensureGcsClient();
+			gcs.create(
+					com.google.cloud.storage.BlobInfo.newBuilder(
+							BlobId.of(props.getBucket(), key))
+							.setContentType("image/png")
+							.build(),
+					bytes);
+			return new StoredObject(buildStorageUrl(props.getBucket(), key), key);
+		}
+		ensureS3Client();
+		PutObjectRequest put = PutObjectRequest.builder()
+				.bucket(props.getBucket())
+				.key(key)
+				.contentType("image/png")
+				.build();
+		s3Client.putObject(put, RequestBody.fromBytes(bytes));
+		return new StoredObject(buildStorageUrl(props.getBucket(), key), key);
+	}
+
+	private String buildKey(String keyHint) {
+		if (keyHint != null && !keyHint.isBlank()) {
+			String normalized = stripLeadingSlash(keyHint.trim());
+			return normalized.endsWith(".png") ? normalized : normalized + ".png";
+		}
+		return DEFAULT_IMAGE_PREFIX + "/generated-" + System.currentTimeMillis() + ".png";
+	}
+
+	private String buildStorageUrl(String bucket, String key) {
+		if (props.getProvider() == WorkerStorageProperties.Provider.GCP) {
+			return "gs://" + bucket + "/" + key;
+		}
+		return "s3://" + bucket + "/" + key;
+	}
+
+	public record StoredObject(
+			String storageUrl,
+			String key
+	) {
 	}
 }
