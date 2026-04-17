@@ -1,5 +1,7 @@
 package com.aiminions.processingservice.jobs.transcribe;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -41,6 +43,7 @@ public class TranscribePipeline {
 			workDir = Files.createTempDirectory("transcribe-" + jobId + "-");
 			generationStatusPublisher.publishProcessing(jobId, "download");
 			Path input = objectStorageTransferService.download(msg.storageUrl(), workDir);
+			BigDecimal inputMb = bytesToMbSafe(input);
 
 			Path normalized = workDir.resolve("normalized.wav");
 			String sourceType = msg.sourceType() == null ? "audio" : msg.sourceType().trim().toLowerCase();
@@ -101,7 +104,15 @@ public class TranscribePipeline {
 			String outputData = objectMapper.writeValueAsString(outputDataNode);
 
 			generationStatusPublisher.publishCompleted(jobId, outputData);
-			mainServiceWorkerClient.notifyCompletion(jobId, "completed", null, outputData);
+			BigDecimal mbAudio = "video".equals(sourceType) ? null : inputMb;
+			BigDecimal mbVideo = "video".equals(sourceType) ? inputMb : null;
+			BigDecimal tokenIn = aiData.path("result").path("tokenIn").isNumber()
+					? aiData.path("result").path("tokenIn").decimalValue()
+					: null;
+			BigDecimal tokenOut = aiData.path("result").path("tokenOut").isNumber()
+					? aiData.path("result").path("tokenOut").decimalValue()
+					: null;
+			mainServiceWorkerClient.notifyCompletion(jobId, "completed", null, outputData, tokenIn, tokenOut, mbAudio, mbVideo);
 			log.info("Transcribe job {} completed (transcript length {})", jobId, transcriptText.length());
 		} catch (JsonProcessingException e) {
 			log.error("Transcribe job {} failed (JSON)", jobId, e);
@@ -128,5 +139,16 @@ public class TranscribePipeline {
 			log.error("Could not report failure to main service for job {}", jobId, ex);
 		}
 		generationStatusPublisher.publishFailed(jobId, err);
+	}
+
+	private static BigDecimal bytesToMbSafe(Path file) {
+		try {
+			long bytes = Files.size(file);
+			if (bytes <= 0) return BigDecimal.ZERO;
+			return BigDecimal.valueOf(bytes)
+					.divide(BigDecimal.valueOf(1024L * 1024L), 6, RoundingMode.HALF_UP);
+		} catch (Exception e) {
+			return null;
+		}
 	}
 }
