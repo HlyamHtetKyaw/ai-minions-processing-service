@@ -10,12 +10,15 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
+import java.util.concurrent.TimeUnit;
 
 import org.springframework.stereotype.Service;
 
 import com.aiminions.processingservice.config.WorkerStorageProperties;
 import com.google.auth.oauth2.GoogleCredentials;
 import com.google.cloud.storage.BlobId;
+import com.google.cloud.storage.BlobInfo;
+import com.google.cloud.storage.HttpMethod;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageOptions;
 
@@ -29,7 +32,12 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3Configuration;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
+import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.presigner.S3Presigner;
+import software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignRequest;
+import software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignRequest;
 import software.amazon.awssdk.core.sync.RequestBody;
 
 @Service
@@ -46,6 +54,7 @@ public class ObjectStorageTransferService {
 	private final WorkerStorageProperties props;
 
 	private volatile S3Client s3Client;
+	private volatile S3Presigner s3Presigner;
 	private volatile Storage gcs;
 
 	@PostConstruct
@@ -110,6 +119,32 @@ public class ObjectStorageTransferService {
 			}
 			this.s3Client = builder.build();
 			log.info("S3 client ready (for s3:// downloads)");
+		}
+	}
+
+	private void ensureS3Presigner() {
+		if (s3Presigner != null) {
+			return;
+		}
+		synchronized (this) {
+			if (s3Presigner != null) {
+				return;
+			}
+			var builder = S3Presigner.builder().region(Region.of(props.getRegion().trim()));
+			if (props.getEndpoint() != null && !props.getEndpoint().isBlank()) {
+				builder.endpointOverride(URI.create(props.getEndpoint().trim()));
+				builder.serviceConfiguration(
+						S3Configuration.builder().pathStyleAccessEnabled(props.isPathStyleAccessEffective()).build());
+			}
+			if (props.getAwsAccessKeyId() != null && !props.getAwsAccessKeyId().isBlank()
+					&& props.getAwsSecretAccessKey() != null && !props.getAwsSecretAccessKey().isBlank()) {
+				builder.credentialsProvider(StaticCredentialsProvider.create(
+						AwsBasicCredentials.create(props.getAwsAccessKeyId().trim(), props.getAwsSecretAccessKey().trim())));
+			} else {
+				builder.credentialsProvider(DefaultCredentialsProvider.create());
+			}
+			this.s3Presigner = builder.build();
+			log.info("S3 presigner ready");
 		}
 	}
 
@@ -222,12 +257,216 @@ public class ObjectStorageTransferService {
 		return new StoredObject(buildStorageUrl(props.getBucket(), key), key);
 	}
 
+	public StoredObject uploadAudio(byte[] bytes, String keyHint, String contentType) {
+		if (bytes == null || bytes.length == 0) {
+			throw new IllegalArgumentException("audio bytes must not be empty");
+		}
+		String ct = contentType == null || contentType.isBlank() ? "audio/mpeg" : contentType.trim();
+		String key = buildAudioKey(keyHint, ct);
+		if (props.getProvider() == WorkerStorageProperties.Provider.GCP) {
+			ensureGcsClient();
+			gcs.create(
+					BlobInfo.newBuilder(props.getBucket(), key).setContentType(ct).build(),
+					bytes);
+			return new StoredObject(buildStorageUrl(props.getBucket(), key), key);
+		}
+		ensureS3Client();
+		PutObjectRequest put = PutObjectRequest.builder()
+				.bucket(props.getBucket())
+				.key(key)
+				.contentType(ct)
+				.build();
+		s3Client.putObject(put, RequestBody.fromBytes(bytes));
+		return new StoredObject(buildStorageUrl(props.getBucket(), key), key);
+	}
+
+	public PresignedObject presignWorkspaceUpload(String keyHint, String contentType) {
+		String key = buildWorkspaceAssetKey(keyHint);
+		String ct = contentType == null || contentType.isBlank() ? "application/octet-stream" : contentType.trim();
+		int ttl = Math.max(60, props.getVideoEditPresignTtlSeconds());
+		if (props.getProvider() == WorkerStorageProperties.Provider.GCP) {
+			ensureGcsClient();
+			BlobInfo blobInfo = BlobInfo.newBuilder(props.getBucket(), key).setContentType(ct).build();
+			String uploadUrl = gcs.signUrl(
+					blobInfo,
+					ttl,
+					TimeUnit.SECONDS,
+					Storage.SignUrlOption.httpMethod(HttpMethod.PUT),
+					Storage.SignUrlOption.withV4Signature(),
+					Storage.SignUrlOption.withContentType())
+					.toString();
+			String readUrl = gcs.signUrl(
+					BlobInfo.newBuilder(props.getBucket(), key).build(),
+					ttl,
+					TimeUnit.SECONDS,
+					Storage.SignUrlOption.httpMethod(HttpMethod.GET),
+					Storage.SignUrlOption.withV4Signature())
+					.toString();
+			return new PresignedObject(uploadUrl, readUrl, key);
+		}
+
+		ensureS3Presigner();
+		PutObjectRequest put = PutObjectRequest.builder()
+				.bucket(props.getBucket())
+				.key(key)
+				.contentType(ct)
+				.build();
+		PutObjectPresignRequest putPresign = PutObjectPresignRequest.builder()
+				.signatureDuration(Duration.ofSeconds(ttl))
+				.putObjectRequest(put)
+				.build();
+		GetObjectRequest get = GetObjectRequest.builder()
+				.bucket(props.getBucket())
+				.key(key)
+				.build();
+		GetObjectPresignRequest getPresign = GetObjectPresignRequest.builder()
+				.signatureDuration(Duration.ofSeconds(ttl))
+				.getObjectRequest(get)
+				.build();
+		return new PresignedObject(
+				s3Presigner.presignPutObject(putPresign).url().toString(),
+				s3Presigner.presignGetObject(getPresign).url().toString(),
+				key);
+	}
+
+	public StoredObject uploadFile(Path source, String keyHint, String contentType) throws IOException {
+		if (source == null || !Files.exists(source)) {
+			throw new IllegalArgumentException("source file does not exist");
+		}
+		String key = buildWorkspaceExportKey(keyHint, source.getFileName().toString());
+		String ct = contentType == null || contentType.isBlank() ? "application/octet-stream" : contentType.trim();
+		if (props.getProvider() == WorkerStorageProperties.Provider.GCP) {
+			ensureGcsClient();
+			byte[] bytes = Files.readAllBytes(source);
+			gcs.create(
+					BlobInfo.newBuilder(props.getBucket(), key).setContentType(ct).build(),
+					bytes);
+			return new StoredObject(buildStorageUrl(props.getBucket(), key), key);
+		}
+		ensureS3Client();
+		PutObjectRequest put = PutObjectRequest.builder()
+				.bucket(props.getBucket())
+				.key(key)
+				.contentType(ct)
+				.build();
+		s3Client.putObject(put, source);
+		return new StoredObject(buildStorageUrl(props.getBucket(), key), key);
+	}
+
+	public String presignWorkspaceRead(String key) {
+		String normalizedKey = stripLeadingSlash(key == null ? "" : key.trim());
+		if (normalizedKey.isBlank()) {
+			throw new IllegalArgumentException("key is required");
+		}
+		normalizedKey = resolveExistingWorkspaceReadKey(normalizedKey);
+		int ttl = Math.max(60, props.getVideoEditPresignTtlSeconds());
+		if (props.getProvider() == WorkerStorageProperties.Provider.GCP) {
+			ensureGcsClient();
+			return gcs.signUrl(
+					BlobInfo.newBuilder(props.getBucket(), normalizedKey).build(),
+					ttl,
+					TimeUnit.SECONDS,
+					Storage.SignUrlOption.httpMethod(HttpMethod.GET),
+					Storage.SignUrlOption.withV4Signature())
+					.toString();
+		}
+		ensureS3Presigner();
+		GetObjectRequest get = GetObjectRequest.builder()
+				.bucket(props.getBucket())
+				.key(normalizedKey)
+				.build();
+		GetObjectPresignRequest getPresign = GetObjectPresignRequest.builder()
+				.signatureDuration(Duration.ofSeconds(ttl))
+				.getObjectRequest(get)
+				.build();
+		return s3Presigner.presignGetObject(getPresign).url().toString();
+	}
+
+	public String resolveExistingWorkspaceReadKey(String key) {
+		if (existsObject(key)) {
+			return key;
+		}
+		if (hasExtension(key)) {
+			return key;
+		}
+		String[] extCandidates = {".mp4", ".mov", ".webm", ".m4a", ".mp3", ".wav", ".aac"};
+		for (String ext : extCandidates) {
+			String candidate = key + ext;
+			if (existsObject(candidate)) {
+				return candidate;
+			}
+		}
+		return key;
+	}
+
 	private String buildKey(String keyHint) {
 		if (keyHint != null && !keyHint.isBlank()) {
 			String normalized = stripLeadingSlash(keyHint.trim());
 			return normalized.endsWith(".png") ? normalized : normalized + ".png";
 		}
 		return DEFAULT_IMAGE_PREFIX + "/generated-" + System.currentTimeMillis() + ".png";
+	}
+
+	private String buildWorkspaceAssetKey(String keyHint) {
+		if (keyHint != null && !keyHint.isBlank()) {
+			return stripLeadingSlash(keyHint.trim());
+		}
+		return "video-editor/assets/" + System.currentTimeMillis() + ".bin";
+	}
+
+	private String buildAudioKey(String keyHint, String contentType) {
+		if (keyHint != null && !keyHint.isBlank()) {
+			String normalized = stripLeadingSlash(keyHint.trim());
+			if (hasExtension(normalized)) {
+				return normalized;
+			}
+			return normalized + extensionFromContentType(contentType);
+		}
+		return "voice-over/generated-" + System.currentTimeMillis() + extensionFromContentType(contentType);
+	}
+
+	private String extensionFromContentType(String contentType) {
+		String ct = contentType == null ? "" : contentType.trim().toLowerCase();
+		return switch (ct) {
+			case "audio/wav", "audio/x-wav" -> ".wav";
+			case "audio/mp4", "audio/m4a", "audio/x-m4a" -> ".m4a";
+			case "audio/ogg", "audio/opus" -> ".ogg";
+			case "audio/webm" -> ".webm";
+			default -> ".mp3";
+		};
+	}
+
+	private String buildWorkspaceExportKey(String keyHint, String fallbackName) {
+		if (keyHint != null && !keyHint.isBlank()) {
+			return stripLeadingSlash(keyHint.trim());
+		}
+		String safeName = sanitizeLocalName(fallbackName == null ? "export.mp4" : fallbackName);
+		return "video-editor/exports/" + System.currentTimeMillis() + "-" + safeName;
+	}
+
+	private boolean existsObject(String key) {
+		if (props.getProvider() == WorkerStorageProperties.Provider.GCP) {
+			ensureGcsClient();
+			return gcs.get(BlobId.of(props.getBucket(), key)) != null;
+		}
+		ensureS3Client();
+		try {
+			s3Client.headObject(HeadObjectRequest.builder()
+					.bucket(props.getBucket())
+					.key(key)
+					.build());
+			return true;
+		} catch (NoSuchKeyException e) {
+			return false;
+		} catch (Exception e) {
+			return false;
+		}
+	}
+
+	private boolean hasExtension(String key) {
+		int slash = key.lastIndexOf('/');
+		int dot = key.lastIndexOf('.');
+		return dot > slash;
 	}
 
 	private String buildStorageUrl(String bucket, String key) {
@@ -239,6 +478,13 @@ public class ObjectStorageTransferService {
 
 	public record StoredObject(
 			String storageUrl,
+			String key
+	) {
+	}
+
+	public record PresignedObject(
+			String uploadUrl,
+			String readUrl,
 			String key
 	) {
 	}

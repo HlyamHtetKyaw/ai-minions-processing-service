@@ -21,6 +21,8 @@ public class WorkerStorageProperties {
 	private String region = "us-east-1";
 	private String endpoint = "";
 	private Boolean pathStyleAccess;
+	private int presignTtlSeconds = 900;
+	private int videoEditPresignTtlSeconds = 900;
 	private String gcpCredentialsPath = "";
 	private String awsAccessKeyId = "";
 	private String awsSecretAccessKey = "";
