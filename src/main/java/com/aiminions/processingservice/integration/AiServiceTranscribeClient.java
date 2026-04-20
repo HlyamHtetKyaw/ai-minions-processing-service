@@ -18,10 +18,15 @@ import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
+/**
+ * HTTP client for AI service transcribe (multipart). Uses AI service route
+ * {@code /ai_service/api/v1/feature/generate}; {@code featureType} in the JSON body is the
+ * AI-service operation discriminator, not a database table.
+ */
 @Component
 @RequiredArgsConstructor
 @Slf4j
-public class AiFeatureServiceClient {
+public class AiServiceTranscribeClient {
 
 	private static final String GENERATE_PATH = "/ai_service/api/v1/feature/generate";
 
