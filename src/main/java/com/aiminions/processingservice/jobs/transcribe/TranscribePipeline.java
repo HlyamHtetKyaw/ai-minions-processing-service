@@ -11,7 +11,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.FileSystemUtils;
 
 import com.aiminions.processingservice.config.ProcessingProperties;
-import com.aiminions.processingservice.integration.AiFeatureServiceClient;
+import com.aiminions.processingservice.integration.AiServiceTranscribeClient;
 import com.aiminions.processingservice.integration.MainServiceWorkerClient;
 import com.aiminions.processingservice.media.ffmpeg.FfmpegRunner;
 import com.aiminions.processingservice.storage.ObjectStorageTransferService;
@@ -33,7 +33,7 @@ public class TranscribePipeline {
 	private final ProcessingProperties processingProperties;
 	private final GenerationStatusPublisher generationStatusPublisher;
 	private final MainServiceWorkerClient mainServiceWorkerClient;
-	private final AiFeatureServiceClient aiFeatureServiceClient;
+	private final AiServiceTranscribeClient aiServiceTranscribeClient;
 	private final ObjectMapper objectMapper;
 
 	public void run(TranscribeJobMessage msg) {
@@ -87,7 +87,7 @@ public class TranscribePipeline {
 
 			generationStatusPublisher.publishProcessing(jobId, "ai_transcription");
 			byte[] cleanedWav = Files.readAllBytes(cleaned);
-			JsonNode aiData = aiFeatureServiceClient.requestTranscriptionWithAudio(jobId, cleanedWav);
+			JsonNode aiData = aiServiceTranscribeClient.requestTranscriptionWithAudio(jobId, cleanedWav);
 
 			ObjectNode outputDataNode = objectMapper.createObjectNode();
 			outputDataNode.put("type", "transcribe");
