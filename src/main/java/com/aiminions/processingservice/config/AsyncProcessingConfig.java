@@ -19,4 +19,15 @@ public class AsyncProcessingConfig {
 		ex.initialize();
 		return ex;
 	}
+
+	@Bean(name = "balancedSyncExecutor")
+	Executor balancedSyncExecutor() {
+		ThreadPoolTaskExecutor ex = new ThreadPoolTaskExecutor();
+		ex.setThreadNamePrefix("balanced-sync-");
+		ex.setCorePoolSize(1);
+		ex.setMaxPoolSize(4);
+		ex.setQueueCapacity(50);
+		ex.initialize();
+		return ex;
+	}
 }

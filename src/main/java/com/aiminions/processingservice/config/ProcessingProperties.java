@@ -12,6 +12,8 @@ public class ProcessingProperties {
 
 	private String redisJobChannel = "ai-minions:jobs:transcribe";
 
+	private String redisBalancedSyncJobChannel = "ai-minions:jobs:balanced-sync";
+
 	private String generationStatusChannelPrefix = "ai-minions:generation:status:";
 
 	private String mainServiceBaseUrl = "http://localhost:8081";
