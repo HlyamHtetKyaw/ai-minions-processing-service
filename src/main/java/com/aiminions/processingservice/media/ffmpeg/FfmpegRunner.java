@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import org.springframework.stereotype.Component;
@@ -29,13 +30,30 @@ public class FfmpegRunner {
 		}
 	}
 
+	public void run(List<String> args, Map<String, String> env) throws IOException, InterruptedException {
+		RunResult r = runRaw(args, env, 45, TimeUnit.MINUTES);
+		if (r.exitCode() != 0) {
+			String out = r.output();
+			String tail = out.length() > 4000 ? out.substring(out.length() - 4000) : out;
+			throw new IllegalStateException("ffmpeg exited with " + r.exitCode() + ": " + tail);
+		}
+	}
+
 	/** Runs ffmpeg and returns stdout+stderr (even when exit code != 0). */
 	public RunResult runRaw(List<String> args, long timeout, TimeUnit unit) throws IOException, InterruptedException {
+		return runRaw(args, Map.of(), timeout, unit);
+	}
+
+	/** Runs ffmpeg with extra environment and returns stdout+stderr (even when exit code != 0). */
+	public RunResult runRaw(List<String> args, Map<String, String> env, long timeout, TimeUnit unit) throws IOException, InterruptedException {
 		List<String> cmd = new ArrayList<>();
 		cmd.add(processingProperties.getFfmpegBinary());
 		cmd.addAll(args);
 		log.debug("ffmpeg {}", String.join(" ", cmd));
 		ProcessBuilder pb = new ProcessBuilder(cmd);
+		if (env != null && !env.isEmpty()) {
+			pb.environment().putAll(env);
+		}
 		pb.redirectErrorStream(true);
 		Process p = pb.start();
 		String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
