@@ -12,6 +12,7 @@ public class ProcessingProperties {
 
 	private String redisJobChannel = "ai-minions:jobs:transcribe";
 
+	private String redisBalancedSyncJobChannel = "ai-minions:jobs:balanced-sync";
 	private String redisSubtitlesJobChannel = "ai-minions:jobs:subtitles";
 
 	private String generationStatusChannelPrefix = "ai-minions:generation:status:";
@@ -21,6 +22,36 @@ public class ProcessingProperties {
 	private String workerToken = "";
 
 	private String ffmpegBinary = "ffmpeg";
+
+	/**
+	 * Optional directory containing fonts for FFmpeg libass subtitles rendering.
+	 * Example: "/usr/share/fonts" in many Linux images.
+	 */
+	private String subtitlesFontsDir = "";
+
+	/**
+	 * Preferred font name for burning subtitles (Unicode Myanmar capable),
+	 * e.g. "Noto Sans Myanmar" or "Pyidaungsu".
+	 */
+	private String subtitlesFontName = "Noto Sans Myanmar";
+
+	/**
+	 * Optional classpath font resource to extract for FFmpeg, e.g. "fonts/Pyidaungsu.ttf".
+	 * Useful when running in a container without system Myanmar fonts.
+	 */
+	private String subtitlesFontResource = "";
+
+	/** Default subtitle burn-in font size (libass). */
+	private int subtitlesFontSize = 22;
+
+	/** Bottom margin for burned subtitles (pixels). */
+	private int subtitlesMarginV = 64;
+
+	/**
+	 * If true, attempt to detect and convert Zawgyi-encoded subtitle text to Unicode
+	 * right before burning subtitles. Keep false by default to avoid altering already-correct Unicode.
+	 */
+	private boolean subtitlesAutoConvertZawgyi = false;
 
 	private double silenceStopDurationSeconds = 0.5;
 

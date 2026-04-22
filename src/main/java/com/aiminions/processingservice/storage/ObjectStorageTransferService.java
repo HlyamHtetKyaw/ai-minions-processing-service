@@ -35,6 +35,7 @@ import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignRequest;
 import software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignRequest;
@@ -397,6 +398,27 @@ public class ObjectStorageTransferService {
 			}
 		}
 		return key;
+	}
+
+	public boolean deleteObject(String key) {
+		String normalizedKey = stripLeadingSlash(key == null ? "" : key.trim());
+		if (normalizedKey.isBlank()) {
+			return false;
+		}
+		if (props.getProvider() == WorkerStorageProperties.Provider.GCP) {
+			ensureGcsClient();
+			return gcs.delete(BlobId.of(props.getBucket(), normalizedKey));
+		}
+		ensureS3Client();
+		try {
+			s3Client.deleteObject(DeleteObjectRequest.builder()
+					.bucket(props.getBucket())
+					.key(normalizedKey)
+					.build());
+			return true;
+		} catch (Exception e) {
+			return false;
+		}
 	}
 
 	private String buildKey(String keyHint) {

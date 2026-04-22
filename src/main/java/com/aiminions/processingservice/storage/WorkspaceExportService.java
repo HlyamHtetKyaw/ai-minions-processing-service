@@ -4,25 +4,39 @@ import com.aiminions.processingservice.media.ffmpeg.FfmpegRunner;
 import com.aiminions.processingservice.storage.dto.WorkspaceExportResponse;
 import com.fasterxml.jackson.databind.JsonNode;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
+import org.springframework.core.io.ClassPathResource;
+
+import com.google.myanmartools.ZawgyiDetector;
+import com.google.myanmartools.TransliterateZ2U;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Pattern;
+import java.util.Map;
 
 import static org.springframework.http.HttpStatus.BAD_REQUEST;
 import static org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class WorkspaceExportService {
+
+	private static final ZawgyiDetector ZAWGYI_DETECTOR = new ZawgyiDetector();
+	private static final TransliterateZ2U Z2U = new TransliterateZ2U("z2u");
+	private static final Pattern MYANMAR_CHARS = Pattern.compile("[\\u1000-\\u109F\\uAA60-\\uAA7F]");
 
 	private final ObjectStorageTransferService objectStorageTransferService;
 	private final FfmpegRunner ffmpegRunner;
+	private final com.aiminions.processingservice.config.ProcessingProperties processingProperties;
 
 	public WorkspaceExportResponse exportVideo(Long userId, JsonNode payload) {
 		if (payload == null || payload.isNull()) {
@@ -39,9 +53,10 @@ public class WorkspaceExportService {
 		Path workDir = null;
 		try {
 			workDir = Files.createTempDirectory("workspace-export-");
+			Path srtFile = maybeWriteSrtFile(payload, workDir);
 			Path input = objectStorageTransferService.download(videoUrl, workDir);
 			Path output = workDir.resolve("export-" + System.currentTimeMillis() + ".mp4");
-			runEncode(input, output, payload, trimStart, trimEnd, speed, workDir);
+			runEncode(input, output, payload, trimStart, trimEnd, speed, workDir, srtFile);
 
 			String keyHint = "video-editor/" + (userId == null ? "unknown" : userId) + "/exports/"
 					+ System.currentTimeMillis() + ".mp4";
@@ -79,7 +94,8 @@ public class WorkspaceExportService {
 			double trimStart,
 			double trimEnd,
 			double speed,
-			Path workDir
+			Path workDir,
+			Path srtFile
 	) throws IOException, InterruptedException {
 		List<String> args = new ArrayList<>();
 		args.add("-y");
@@ -100,7 +116,7 @@ public class WorkspaceExportService {
 			args.add(image.path().toString());
 		}
 
-		String filterComplex = buildFilterComplex(payload, trimStart, trimEnd, speed, images);
+		String filterComplex = buildFilterComplex(payload, trimStart, trimEnd, speed, images, srtFile, workDir);
 		args.add("-filter_complex");
 		args.add(filterComplex);
 		args.add("-map");
@@ -137,7 +153,80 @@ public class WorkspaceExportService {
 		args.add("-movflags");
 		args.add("+faststart");
 		args.add(output.toString());
+		// Force libass to resolve fonts from our extracted fonts dir (avoids silent fallback).
+		if (srtFile != null && workDir != null) {
+			String fontsDir = processingProperties.getSubtitlesFontsDir() == null ? "" : processingProperties.getSubtitlesFontsDir().trim();
+			if (fontsDir.isBlank()) {
+				fontsDir = extractBundledFontDir(workDir);
+			}
+			if (!fontsDir.isBlank()) {
+				// Ask libass to be verbose about font selection so we can verify it's using our font.
+				args.add(0, "verbose");
+				args.add(0, "-loglevel");
+				Path fontConfig = writeFontConfig(workDir, fontsDir);
+				Map<String, String> env = Map.of(
+						"FONTCONFIG_FILE", fontConfig.toString(),
+						"FONTCONFIG_PATH", fontConfig.getParent().toString(),
+						"XDG_CACHE_HOME", workDir.resolve("fc-cache").toString()
+				);
+				var r = ffmpegRunner.runRaw(args, env, 45, java.util.concurrent.TimeUnit.MINUTES);
+				logFontSelection(r.output());
+				if (r.exitCode() != 0) {
+					String out = r.output();
+					String tail = out.length() > 4000 ? out.substring(out.length() - 4000) : out;
+					throw new IllegalStateException("ffmpeg exited with " + r.exitCode() + ": " + tail);
+				}
+				return;
+			}
+		}
 		ffmpegRunner.run(args);
+	}
+
+	private static void logFontSelection(String ffmpegOut) {
+		if (ffmpegOut == null || ffmpegOut.isBlank()) return;
+		// libass prints font selection lines in verbose mode.
+		String[] lines = ffmpegOut.split("\\R");
+		StringBuilder sb = new StringBuilder();
+		for (String line : lines) {
+			String l = line.trim();
+			if (l.isEmpty()) continue;
+			if (l.contains("fontselect") || l.contains("Using font") || l.contains("font provider") || l.contains("libass")) {
+				sb.append(l).append('\n');
+			}
+		}
+		if (!sb.isEmpty()) {
+			// Trim to avoid huge logs.
+			String out = sb.toString();
+			if (out.length() > 4000) out = out.substring(0, 4000);
+			org.slf4j.LoggerFactory.getLogger(WorkspaceExportService.class).info("FFmpeg/libass font debug:\n{}", out);
+		}
+	}
+
+	private static Path writeFontConfig(Path workDir, String fontsDir) throws IOException {
+		Path conf = workDir.resolve("fonts.conf");
+		// Minimal fontconfig pointing at the extracted font directory.
+		// This makes libass reliably pick our bundled Myanmar Unicode font instead of system fallbacks.
+		String xml = """
+				<?xml version="1.0"?>
+				<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+				<fontconfig>
+				  <dir>%s</dir>
+				  <cachedir>%s</cachedir>
+				  <config>
+				    <rescan>
+				      <int>30</int>
+				    </rescan>
+				  </config>
+				</fontconfig>
+				""".formatted(escapeXml(fontsDir), escapeXml(workDir.resolve("fc-cache").toString()));
+		Files.writeString(conf, xml);
+		return conf;
+	}
+
+	private static String escapeXml(String v) {
+		if (v == null) return "";
+		return v.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+				.replace("\"", "&quot;").replace("'", "&apos;");
 	}
 
 	private String buildFilterComplex(
@@ -145,7 +234,9 @@ public class WorkspaceExportService {
 			double trimStart,
 			double trimEnd,
 			double speed,
-			List<ImageInput> images
+			List<ImageInput> images,
+			Path srtFile,
+			Path workDir
 	) {
 		List<String> parts = new ArrayList<>();
 		double safeSpeed = Math.abs(speed) < 0.0001d ? 1d : speed;
@@ -158,6 +249,21 @@ public class WorkspaceExportService {
 
 		String current = "v0";
 		parts.add("[0:v]setpts=" + formatDecimal(1d / safeSpeed) + "*PTS[" + current + "]");
+
+		boolean protectFlip = readBoolean(payload, "protectFlip", false);
+		double protectHueDeg = readNumber(payload, "protectHueDeg", 0d);
+		if (protectFlip || Math.abs(protectHueDeg) > 0.0001d) {
+			String next = "vp0";
+			List<String> ops = new ArrayList<>();
+			if (protectFlip) {
+				ops.add("hflip");
+			}
+			if (Math.abs(protectHueDeg) > 0.0001d) {
+				ops.add("hue=h=" + formatDecimal(protectHueDeg));
+			}
+			parts.add("[" + current + "]" + String.join(",", ops) + "[" + next + "]");
+			current = next;
+		}
 
 		JsonNode textLayers = payload.path("textLayers");
 		if (textLayers.isArray()) {
@@ -230,8 +336,133 @@ public class WorkspaceExportService {
 			current = next;
 		}
 
+		if (srtFile != null) {
+			String next = "vsrt";
+			// Burn-in subtitles (best-effort). Assumes ffmpeg build includes libass.
+			String escaped = srtFile.toString().replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'");
+			String fontsDir = processingProperties.getSubtitlesFontsDir() == null ? "" : processingProperties.getSubtitlesFontsDir().trim();
+			if (fontsDir.isBlank() && workDir != null) {
+				fontsDir = extractBundledFontDir(workDir);
+			}
+			String fontName = processingProperties.getSubtitlesFontName() == null ? "" : processingProperties.getSubtitlesFontName().trim();
+			if (fontName.isBlank()) {
+				fontName = "Noto Sans Myanmar";
+			}
+			int fontSize = Math.max(14, Math.min(60, processingProperties.getSubtitlesFontSize()));
+			int marginV = Math.max(0, Math.min(300, processingProperties.getSubtitlesMarginV()));
+			// Force Unicode decoding and prefer a Myanmar Unicode-capable font.
+			// Note: libass uses system fontconfig; if the font isn't installed, it will fall back.
+			String style = "FontName=" + escapeAss(fontName)
+					+ ",FontSize=" + fontSize
+					+ ",PrimaryColour=&H00FFFFFF"
+					+ ",OutlineColour=&H00000000"
+					+ ",Outline=1"
+					+ ",Shadow=0"
+					+ ",Alignment=2"
+					+ ",MarginV=" + marginV;
+
+			String filter = "subtitles='" + escaped + "':charenc=UTF-8:force_style='" + style + "'";
+			if (!fontsDir.isBlank()) {
+				String fd = fontsDir.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'");
+				filter = filter + ":fontsdir='" + fd + "'";
+			}
+			parts.add("[" + current + "]" + filter + "[" + next + "]");
+			current = next;
+		}
+
 		parts.add("[" + current + "]format=yuv420p[vout]");
 		return String.join(";", parts);
+	}
+
+	private Path maybeWriteSrtFile(JsonNode payload, Path workDir) throws IOException {
+		if (payload == null || payload.isNull()) return null;
+		boolean burn = readBoolean(payload, "burnSubtitles", false);
+		if (!burn) return null;
+		String srtText = readText(payload, "subtitlesSrtText", "");
+		if (srtText == null || srtText.trim().isEmpty()) return null;
+		if (processingProperties.isSubtitlesAutoConvertZawgyi()) {
+			srtText = ensureUnicodeMyanmar(srtText);
+		}
+		Path srt = workDir.resolve("burned-subtitles.srt");
+		Files.writeString(srt, srtText);
+		return srt;
+	}
+
+	private static String ensureUnicodeMyanmar(String text) {
+		if (text == null || text.isBlank()) return text;
+		// Detect/convert line-by-line. Running detection on the whole SRT (timestamps + English)
+		// can dilute the detector score and miss mixed-encoding subtitles.
+		StringBuilder out = new StringBuilder(text.length());
+		String[] lines = text.split("\\R", -1);
+		for (int i = 0; i < lines.length; i++) {
+			String line = lines[i];
+			out.append(ensureUnicodeMyanmarLine(line));
+			if (i < lines.length - 1) out.append('\n');
+		}
+		return out.toString();
+	}
+
+	private static String ensureUnicodeMyanmarLine(String line) {
+		if (line == null || line.isBlank()) return line;
+		if (!MYANMAR_CHARS.matcher(line).find()) return line;
+
+		// Score only the Myanmar-containing parts to avoid timestamp/latin dilution.
+		String my = line.replaceAll("[^\\u1000-\\u109F\\uAA60-\\uAA7F]+", " ").trim();
+		if (my.isBlank()) return line;
+
+		double zawgyiProb = ZAWGYI_DETECTOR.getZawgyiProbability(my);
+		// Lower threshold: better to convert than to ship broken burn-in.
+		if (zawgyiProb >= 0.20d) {
+			return Z2U.convert(line);
+		}
+		return line;
+	}
+
+	private static String escapeAss(String v) {
+		if (v == null) return "";
+		// ASS force_style string is single-quoted in ffmpeg filter; escape quotes/backslashes.
+		return v.replace("\\", "\\\\").replace("'", "\\'");
+	}
+
+	private String extractBundledFontDir(Path workDir) {
+		try {
+			String resPath = processingProperties.getSubtitlesFontResource() == null
+					? ""
+					: processingProperties.getSubtitlesFontResource().trim();
+			if (resPath.isBlank()) {
+				return "";
+			}
+			Path fonts = workDir.resolve("fonts");
+			Files.createDirectories(fonts);
+			copyFontResourceIfExists(resPath, fonts, "subtitle-font.ttf");
+			// If the configured font is a face inside the same family, also extract common siblings.
+			// libass may request a specific face (e.g. Regular) when resolving FontName.
+			if (resPath.startsWith("fonts/") && resPath.endsWith(".ttf")) {
+				String base = resPath.substring(0, resPath.length() - ".ttf".length());
+				copyFontResourceIfExists(base + "-Regular.ttf", fonts, null);
+				copyFontResourceIfExists(base + "-Bold.ttf", fonts, null);
+				copyFontResourceIfExists(base + "-Italic.ttf", fonts, null);
+				copyFontResourceIfExists(base + "-BoldItalic.ttf", fonts, null);
+			}
+			return fonts.toString();
+		} catch (Exception e) {
+			return "";
+		}
+	}
+
+	private static void copyFontResourceIfExists(String classpathPath, Path outDir, String fallbackName) throws IOException {
+		ClassPathResource res = new ClassPathResource(classpathPath);
+		if (!res.exists()) {
+			return;
+		}
+		String name = Path.of(classpathPath).getFileName().toString();
+		if (name == null || name.isBlank()) {
+			name = fallbackName == null ? "subtitle-font.ttf" : fallbackName;
+		}
+		Path out = outDir.resolve(name);
+		try (InputStream in = res.getInputStream()) {
+			Files.copy(in, out, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+		}
 	}
 
 	private List<ImageInput> collectImageInputs(JsonNode payload, Path workDir) throws IOException, InterruptedException {

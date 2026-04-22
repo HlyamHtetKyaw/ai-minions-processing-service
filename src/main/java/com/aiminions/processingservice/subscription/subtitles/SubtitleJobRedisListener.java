@@ -3,7 +3,6 @@ package com.aiminions.processingservice.subscription.subtitles;
 import com.aiminions.processingservice.jobs.subtitles.SubtitleJobMessage;
 import com.aiminions.processingservice.jobs.subtitles.SubtitlePipeline;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.redis.connection.Message;
@@ -14,15 +13,22 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.Executor;
 
 @Component
-@RequiredArgsConstructor
 @Slf4j
 public class SubtitleJobRedisListener implements MessageListener {
 
 	private final ObjectMapper objectMapper;
 	private final SubtitlePipeline subtitlePipeline;
-
-	@Qualifier("transcribeExecutor")
 	private final Executor executor;
+
+	public SubtitleJobRedisListener(
+			ObjectMapper objectMapper,
+			SubtitlePipeline subtitlePipeline,
+			@Qualifier("transcribeExecutor") Executor executor
+	) {
+		this.objectMapper = objectMapper;
+		this.subtitlePipeline = subtitlePipeline;
+		this.executor = executor;
+	}
 
 	@Override
 	public void onMessage(Message message, byte[] pattern) {
