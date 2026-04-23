@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.regex.Pattern;
 import java.util.Map;
+import java.util.regex.Matcher;
 
 import static org.springframework.http.HttpStatus.BAD_REQUEST;
 import static org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR;
@@ -97,6 +98,7 @@ public class WorkspaceExportService {
 			Path workDir,
 			Path srtFile
 	) throws IOException, InterruptedException {
+		int[] size = probeVideoSize(input);
 		List<String> args = new ArrayList<>();
 		args.add("-y");
 		if (trimStart > 0) {
@@ -116,7 +118,7 @@ public class WorkspaceExportService {
 			args.add(image.path().toString());
 		}
 
-		String filterComplex = buildFilterComplex(payload, trimStart, trimEnd, speed, images, srtFile, workDir);
+		String filterComplex = buildFilterComplex(payload, trimStart, trimEnd, speed, images, srtFile, workDir, size[0], size[1]);
 		args.add("-filter_complex");
 		args.add(filterComplex);
 		args.add("-map");
@@ -155,13 +157,14 @@ public class WorkspaceExportService {
 		args.add(output.toString());
 		// Force libass to resolve fonts from our extracted fonts dir (avoids silent fallback).
 		if (srtFile != null && workDir != null) {
-			String fontsDir = processingProperties.getSubtitlesFontsDir() == null ? "" : processingProperties.getSubtitlesFontsDir().trim();
+			// Prefer bundled font dir for deterministic production output.
+			String fontsDir = extractBundledFontDir(workDir);
 			if (fontsDir.isBlank()) {
-				fontsDir = extractBundledFontDir(workDir);
+				fontsDir = processingProperties.getSubtitlesFontsDir() == null ? "" : processingProperties.getSubtitlesFontsDir().trim();
 			}
 			if (!fontsDir.isBlank()) {
 				// Ask libass to be verbose about font selection so we can verify it's using our font.
-				args.add(0, "verbose");
+				args.add(0, "debug");
 				args.add(0, "-loglevel");
 				Path fontConfig = writeFontConfig(workDir, fontsDir);
 				Map<String, String> env = Map.of(
@@ -182,6 +185,29 @@ public class WorkspaceExportService {
 		ffmpegRunner.run(args);
 	}
 
+	private static final Pattern VIDEO_SIZE = Pattern.compile("(\\d{2,5})x(\\d{2,5})");
+
+	private int[] probeVideoSize(Path input) {
+		try {
+			// ffmpeg prints stream info on stderr and exits non-zero without output; we still get combined output.
+			var r = ffmpegRunner.runRaw(List.of("-hide_banner", "-i", input.toString()), 30, java.util.concurrent.TimeUnit.SECONDS);
+			String out = r.output() == null ? "" : r.output();
+			// Match the first WxH after "Video:" line.
+			for (String line : out.split("\\R")) {
+				if (!line.contains("Video:")) continue;
+				Matcher m = VIDEO_SIZE.matcher(line);
+				if (m.find()) {
+					int w = Integer.parseInt(m.group(1));
+					int h = Integer.parseInt(m.group(2));
+					if (w > 0 && h > 0) return new int[]{w, h};
+				}
+			}
+		} catch (Exception ignored) {
+		}
+		// Safe fallback for vertical shorts.
+		return new int[]{1080, 1920};
+	}
+
 	private static void logFontSelection(String ffmpegOut) {
 		if (ffmpegOut == null || ffmpegOut.isBlank()) return;
 		// libass prints font selection lines in verbose mode.
@@ -190,7 +216,11 @@ public class WorkspaceExportService {
 		for (String line : lines) {
 			String l = line.trim();
 			if (l.isEmpty()) continue;
-			if (l.contains("fontselect") || l.contains("Using font") || l.contains("font provider") || l.contains("libass")) {
+			if (l.contains("fontselect")
+					|| l.contains("Using font")
+					|| l.contains("font provider")
+					|| l.contains("libass")
+					|| l.contains("Loading font file")) {
 				sb.append(l).append('\n');
 			}
 		}
@@ -236,7 +266,9 @@ public class WorkspaceExportService {
 			double speed,
 			List<ImageInput> images,
 			Path srtFile,
-			Path workDir
+			Path workDir,
+			int videoW,
+			int videoH
 	) {
 		List<String> parts = new ArrayList<>();
 		double safeSpeed = Math.abs(speed) < 0.0001d ? 1d : speed;
@@ -338,30 +370,46 @@ public class WorkspaceExportService {
 
 		if (srtFile != null) {
 			String next = "vsrt";
-			// Burn-in subtitles (best-effort). Assumes ffmpeg build includes libass.
-			String escaped = srtFile.toString().replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'");
-			String fontsDir = processingProperties.getSubtitlesFontsDir() == null ? "" : processingProperties.getSubtitlesFontsDir().trim();
-			if (fontsDir.isBlank() && workDir != null) {
+			// Convert SRT -> ASS and burn via ass filter with complex shaping for Myanmar.
+			Path assFile = maybeConvertSrtToAss(srtFile, workDir, payload, videoW, videoH);
+			Path burnFile = assFile != null ? assFile : srtFile;
+			String escaped = burnFile.toString().replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'");
+			// Prefer bundled font dir for deterministic production output.
+			String fontsDir = "";
+			if (workDir != null) {
 				fontsDir = extractBundledFontDir(workDir);
+			}
+			if (fontsDir.isBlank()) {
+				fontsDir = processingProperties.getSubtitlesFontsDir() == null ? "" : processingProperties.getSubtitlesFontsDir().trim();
 			}
 			String fontName = processingProperties.getSubtitlesFontName() == null ? "" : processingProperties.getSubtitlesFontName().trim();
 			if (fontName.isBlank()) {
-				fontName = "Noto Sans Myanmar";
+				// Bundled default (resources/fonts/NotoSerifMyanmar.ttf)
+				fontName = "Noto Serif Myanmar";
 			}
-			int fontSize = Math.max(14, Math.min(60, processingProperties.getSubtitlesFontSize()));
+			int fontSize = readInt(payload, "subtitlesFontSize", processingProperties.getSubtitlesFontSize());
+			fontSize = Math.max(14, Math.min(60, fontSize));
 			int marginV = Math.max(0, Math.min(300, processingProperties.getSubtitlesMarginV()));
 			// Force Unicode decoding and prefer a Myanmar Unicode-capable font.
 			// Note: libass uses system fontconfig; if the font isn't installed, it will fall back.
 			String style = "FontName=" + escapeAss(fontName)
 					+ ",FontSize=" + fontSize
 					+ ",PrimaryColour=&H00FFFFFF"
-					+ ",OutlineColour=&H00000000"
-					+ ",Outline=1"
+					// Outlines can make Myanmar clusters look broken in some libass render paths.
+					// Prefer a background box for readability instead of stroke outline.
+					+ ",BorderStyle=3"
+					+ ",BackColour=&H80000000"
+					+ ",Outline=0"
 					+ ",Shadow=0"
 					+ ",Alignment=2"
 					+ ",MarginV=" + marginV;
 
-			String filter = "subtitles='" + escaped + "':charenc=UTF-8:force_style='" + style + "'";
+			String filter;
+			if (burnFile.toString().toLowerCase(Locale.ROOT).endsWith(".ass")) {
+				filter = "ass='" + escaped + "':shaping=complex:original_size=" + videoW + "x" + videoH;
+			} else {
+				filter = "subtitles='" + escaped + "':charenc=UTF-8:wrap_unicode=1:force_style='" + style + "'";
+			}
 			if (!fontsDir.isBlank()) {
 				String fd = fontsDir.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'");
 				filter = filter + ":fontsdir='" + fd + "'";
@@ -372,6 +420,83 @@ public class WorkspaceExportService {
 
 		parts.add("[" + current + "]format=yuv420p[vout]");
 		return String.join(";", parts);
+	}
+
+	private Path maybeConvertSrtToAss(Path srtFile, Path workDir, JsonNode payload, int videoW, int videoH) {
+		try {
+			if (srtFile == null || workDir == null) return null;
+			if (!srtFile.toString().toLowerCase(Locale.ROOT).endsWith(".srt")) return null;
+			Path ass = workDir.resolve("burned-subtitles.ass");
+			// Convert with ffmpeg so timings and formatting are handled consistently.
+			ffmpegRunner.run(List.of("-y", "-hide_banner", "-loglevel", "error", "-i", srtFile.toString(), "-f", "ass", ass.toString()));
+
+			// Rewrite ASS script + style to use our configured font + size + margins,
+			// and apply optional user-position via \pos(x,y).
+			String fontName = processingProperties.getSubtitlesFontName() == null ? "" : processingProperties.getSubtitlesFontName().trim();
+			if (fontName.isBlank()) fontName = "Pyidaungsu";
+			int fontSize = readInt(payload, "subtitlesFontSize", processingProperties.getSubtitlesFontSize());
+			fontSize = Math.max(14, Math.min(60, fontSize));
+			int marginV = Math.max(0, Math.min(300, processingProperties.getSubtitlesMarginV()));
+
+			double posX = readNumber(payload.path("subtitlesPosition"), "x", -1d);
+			double posY = readNumber(payload.path("subtitlesPosition"), "y", -1d);
+			boolean hasPos = posX >= 0d && posX <= 1d && posY >= 0d && posY <= 1d && videoW > 0 && videoH > 0;
+			int px = hasPos ? (int) Math.round(posX * videoW) : 0;
+			int py = hasPos ? (int) Math.round(posY * videoH) : 0;
+
+			String content = Files.readString(ass);
+			String[] lines = content.split("\\R", -1);
+			StringBuilder out = new StringBuilder(content.length());
+			for (String line : lines) {
+				if (line.startsWith("PlayResX:")) {
+					line = "PlayResX: " + Math.max(2, videoW);
+				} else if (line.startsWith("PlayResY:")) {
+					line = "PlayResY: " + Math.max(2, videoH);
+				}
+				if (line.startsWith("Style: Default,")) {
+					// ASS style format from ffmpeg: Style: Default,Arial,16,&Hffffff,...
+					// We'll keep colors but force font + size + alignment + margins and disable outline.
+					String[] parts = line.split(",", -1);
+					if (parts.length >= 23) {
+						parts[1] = escapeAssField(fontName);
+						parts[2] = String.valueOf(fontSize);
+						// BorderStyle=3 + BackColour provides readability without outline.
+						parts[16] = "3";           // BorderStyle
+						parts[17] = "0";           // Outline
+						parts[18] = "0";           // Shadow
+						parts[19] = hasPos ? "5" : "2"; // Alignment center (with \pos) or bottom-center
+						parts[22] = String.valueOf(marginV); // MarginV
+						line = String.join(",", parts);
+					}
+				}
+
+				if (hasPos && line.startsWith("Dialogue:")) {
+					int idx = line.lastIndexOf(',');
+					if (idx > 0 && idx < line.length() - 1) {
+						String head = line.substring(0, idx + 1);
+						String txt = line.substring(idx + 1);
+						String tag = "{\\\\pos(" + px + "," + py + ")\\\\an5}";
+						if (!txt.startsWith("{")) {
+							line = head + tag + txt;
+						} else {
+							// If it already has tags, prepend ours to keep it deterministic.
+							line = head + tag + txt;
+						}
+					}
+				}
+				out.append(line).append('\n');
+			}
+			Files.writeString(ass, out.toString());
+			return ass;
+		} catch (Exception ignored) {
+			return null;
+		}
+	}
+
+	private static String escapeAssField(String v) {
+		if (v == null) return "";
+		// Style fields are comma-separated; avoid commas.
+		return v.replace(",", " ");
 	}
 
 	private Path maybeWriteSrtFile(JsonNode payload, Path workDir) throws IOException {
@@ -542,6 +667,24 @@ public class WorkspaceExportService {
 		if (node.isTextual()) {
 			try {
 				return Double.parseDouble(node.asText().trim());
+			} catch (NumberFormatException ignored) {
+				return defaultValue;
+			}
+		}
+		return defaultValue;
+	}
+
+	private int readInt(JsonNode payload, String field, int defaultValue) {
+		JsonNode node = payload.get(field);
+		if (node == null || node.isNull()) {
+			return defaultValue;
+		}
+		if (node.isInt() || node.isLong() || node.isNumber()) {
+			return node.asInt(defaultValue);
+		}
+		if (node.isTextual()) {
+			try {
+				return Integer.parseInt(node.asText().trim());
 			} catch (NumberFormatException ignored) {
 				return defaultValue;
 			}
