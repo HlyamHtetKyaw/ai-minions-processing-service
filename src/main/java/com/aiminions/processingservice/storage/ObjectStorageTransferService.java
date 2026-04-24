@@ -160,8 +160,23 @@ public class ObjectStorageTransferService {
 		return p;
 	}
 
+	/**
+	 * Strips a URI fragment (e.g. {@code #wk=...} from the main-service media refresh) so
+	 * HTTP/HTTPS fetches and {@link HttpRequest} do not see a bogus fragment, and the query
+	 * string for GCS presigned URLs stays intact.
+	 */
+	public static String stripUrlFragmentForDownload(String storageUrl) {
+		if (storageUrl == null) {
+			return null;
+		}
+		String t = storageUrl.trim();
+		int h = t.indexOf('#');
+		return h < 0 ? t : t.substring(0, h);
+	}
+
 	public Path download(String storageUrl, Path workDir) throws IOException, InterruptedException {
-		URI u = URI.create(storageUrl.trim());
+		String forDownload = stripUrlFragmentForDownload(storageUrl);
+		URI u = URI.create(forDownload.trim());
 		String scheme = u.getScheme();
 		if (scheme == null) {
 			throw new IllegalArgumentException("Unsupported storage URL (no scheme): " + storageUrl);
@@ -180,13 +195,45 @@ public class ObjectStorageTransferService {
 		};
 	}
 
+	private static final String HTTP_DOWNLOAD_USER_AGENT =
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+					+ "Chrome/120.0.0.0 Safari/537.36 ai-minions-export/1.0";
+
+	/**
+	 * Many CDNs (e.g. Pinterest {@code i.pinimg.com}) require a page {@code Referer} or they return 403.
+	 */
+	private static String httpRefererFor(URI u) {
+		if (u == null) {
+			return null;
+		}
+		String host = u.getHost();
+		if (host == null || host.isBlank()) {
+			return null;
+		}
+		String h = host.toLowerCase();
+		if (h.endsWith("pinimg.com") || h.contains("pinterest.com")) {
+			return "https://www.pinterest.com/";
+		}
+		String scheme = u.getScheme() != null && !u.getScheme().isBlank() ? u.getScheme() : "https";
+		return scheme + "://" + host + "/";
+	}
+
 	private Path httpDownload(URI u, Path workDir) throws IOException, InterruptedException {
 		String name = Path.of(u.getPath()).getFileName().toString();
 		if (name == null || name.isBlank() || name.equals("/")) {
 			name = "download.bin";
 		}
 		Path out = workDir.resolve(sanitizeLocalName(name));
-		HttpRequest req = HttpRequest.newBuilder(u).timeout(Duration.ofMinutes(30)).GET().build();
+		var b = HttpRequest.newBuilder(u)
+				.timeout(Duration.ofMinutes(30))
+				.header("User-Agent", HTTP_DOWNLOAD_USER_AGENT)
+				.header("Accept", "*/*")
+				.header("Accept-Language", "en-US,en;q=0.9");
+		String ref = httpRefererFor(u);
+		if (ref != null) {
+			b = b.header("Referer", ref);
+		}
+		HttpRequest req = b.GET().build();
 		HttpResponse<byte[]> res = HTTP.send(req, HttpResponse.BodyHandlers.ofByteArray());
 		if (res.statusCode() / 100 != 2) {
 			throw new IOException("HTTP download failed: " + res.statusCode() + " for " + u);
