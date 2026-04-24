@@ -36,6 +36,12 @@ public class WorkspaceExportService {
 	private static final Pattern MYANMAR_CHARS = Pattern.compile("[\\u1000-\\u109F\\uAA60-\\uAA7F]");
 
 	/**
+	 * Same as frontend {@code SUBTITLE_PREVIEW_TO_BURN_FONT_FACTOR}: libass {@code FontSize} reads smaller
+	 * than browser CSS px for the same geometry, especially for Myanmar shaping.
+	 */
+	private static final double SUBTITLE_PREVIEW_TO_BURN_FONT_FACTOR = 1.52d;
+
+	/**
 	 * ASS {@code BackColour} for black at UI opacity 0–100 (%). Format {@code &HAABBGGRR}; {@code AA} is 00=opaque, FF=transparent.
 	 */
 	private static String assBackColourBlackFromOpacityPercent(int opacityPercent) {
@@ -43,6 +49,26 @@ public class WorkspaceExportService {
 		int aa = (int) Math.round(255.0 * (1.0 - o / 100.0));
 		aa = Math.max(0, Math.min(255, aa));
 		return String.format(Locale.ROOT, "&H%02X000000", aa);
+	}
+
+	/**
+	 * For {@code BorderStyle=3} (opaque box), libass/VSFilter use {@code Outline} as the box padding around the
+	 * text; {@code Outline=0} often yields no visible background — matching reports of "opacity missing" on burn-in.
+	 */
+	private static int subtitleBoxOutlinePx(int fontSize) {
+		int cap = fontSize > 120 ? 26 : 18;
+		return Math.max(3, Math.min(cap, (int) Math.round(fontSize * 0.14d)));
+	}
+
+	/**
+	 * FFmpeg's {@code subtitles=} {@code force_style} value is parsed as a filter option; unescaped {@code &}
+	 * in {@code &H...} colours can truncate options and drop font/back styles.
+	 */
+	private static String escapeAmpersandsForFfmpegFilterOption(String s) {
+		if (s == null || s.isBlank()) {
+			return "";
+		}
+		return s.replace("&", "\\&");
 	}
 
 	private final ObjectStorageTransferService objectStorageTransferService;
@@ -405,21 +431,20 @@ public class WorkspaceExportService {
 				// Bundled default (resources/fonts/NotoSerifMyanmar.ttf)
 				fontName = "Noto Serif Myanmar";
 			}
-			int fontSize = readInt(payload, "subtitlesFontSize", processingProperties.getSubtitlesFontSize());
-			fontSize = Math.max(14, Math.min(60, fontSize));
+			int fontSize = resolveSubtitleBurnFontSize(payload, videoW, videoH);
 			int marginV = Math.max(0, Math.min(300, processingProperties.getSubtitlesMarginV()));
 			int bgOpacity = readInt(payload, "subtitlesBackgroundOpacity", 65);
 			String backColour = assBackColourBlackFromOpacityPercent(bgOpacity);
+			int boxOutline = subtitleBoxOutlinePx(fontSize);
 			// Force Unicode decoding and prefer a Myanmar Unicode-capable font.
 			// Note: libass uses system fontconfig; if the font isn't installed, it will fall back.
 			String style = "FontName=" + escapeAss(fontName)
 					+ ",FontSize=" + fontSize
 					+ ",PrimaryColour=&H00FFFFFF"
-					// Outlines can make Myanmar clusters look broken in some libass render paths.
-					// Prefer a background box for readability instead of stroke outline.
+					// BorderStyle=3: box fill uses BackColour; Outline sets box padding (must be >0).
 					+ ",BorderStyle=3"
 					+ ",BackColour=" + backColour
-					+ ",Outline=0"
+					+ ",Outline=" + boxOutline
 					+ ",Shadow=0"
 					+ ",Alignment=2"
 					+ ",MarginV=" + marginV;
@@ -428,7 +453,8 @@ public class WorkspaceExportService {
 			if (burnFile.toString().toLowerCase(Locale.ROOT).endsWith(".ass")) {
 				filter = "ass='" + escaped + "':shaping=complex:original_size=" + videoW + "x" + videoH;
 			} else {
-				filter = "subtitles='" + escaped + "':charenc=UTF-8:wrap_unicode=1:force_style='" + style + "'";
+				filter = "subtitles='" + escaped + "':charenc=UTF-8:wrap_unicode=1:force_style='"
+						+ escapeAmpersandsForFfmpegFilterOption(style) + "'";
 			}
 			if (!fontsDir.isBlank()) {
 				String fd = fontsDir.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'");
@@ -453,12 +479,14 @@ public class WorkspaceExportService {
 			// Rewrite ASS script + style to use our configured font + size + margins,
 			// and apply optional user-position via \pos(x,y).
 			String fontName = processingProperties.getSubtitlesFontName() == null ? "" : processingProperties.getSubtitlesFontName().trim();
-			if (fontName.isBlank()) fontName = "Pyidaungsu";
-			int fontSize = readInt(payload, "subtitlesFontSize", processingProperties.getSubtitlesFontSize());
-			fontSize = Math.max(14, Math.min(60, fontSize));
+			if (fontName.isBlank()) {
+				fontName = "Noto Serif Myanmar";
+			}
+			int fontSize = resolveSubtitleBurnFontSize(payload, videoW, videoH);
 			int marginV = Math.max(0, Math.min(300, processingProperties.getSubtitlesMarginV()));
 			int bgOpacity = readInt(payload, "subtitlesBackgroundOpacity", 65);
 			String backColour = assBackColourBlackFromOpacityPercent(bgOpacity);
+			int boxOutline = subtitleBoxOutlinePx(fontSize);
 
 			double posX = readNumber(payload.path("subtitlesPosition"), "x", -1d);
 			double posY = readNumber(payload.path("subtitlesPosition"), "y", -1d);
@@ -475,18 +503,20 @@ public class WorkspaceExportService {
 				} else if (line.startsWith("PlayResY:")) {
 					line = "PlayResY: " + Math.max(2, videoH);
 				}
-				if (line.startsWith("Style: Default,")) {
-					// ASS style format from ffmpeg (field order): Fontname, Fontsize, Primary, Secondary,
-					// Outline, Back, Bold, Italic, Underline, Strike, ScaleX, ScaleY, Spacing, Angle,
-					// BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-					String[] parts = line.split(",", -1);
+				String lineNorm = line.replace("\uFEFF", "").stripLeading();
+				if (lineNorm.regionMatches(true, 0, "Style: Default,", 0, "Style: Default,".length())) {
+					// ASS V4+ fields: Fontname, Fontsize, Primary, Secondary, OutlineColour, BackColour, ...
+					// then BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+					String[] parts = lineNorm.split(",", -1);
 					if (parts.length >= 23) {
 						parts[1] = escapeAssField(fontName);
 						parts[2] = String.valueOf(fontSize);
+						parts[3] = "&H00FFFFFF";
+						parts[4] = "&H00000000";
+						parts[5] = "&H00000000";
 						parts[6] = backColour;
-						// BorderStyle=3 + BackColour: opaque box behind text; no outline/shadow.
 						parts[15] = "3";
-						parts[16] = "0";
+						parts[16] = String.valueOf(boxOutline);
 						parts[17] = "0";
 						parts[18] = hasPos ? "5" : "2"; // an5 + \pos vs bottom-center
 						parts[21] = String.valueOf(marginV);
@@ -512,7 +542,8 @@ public class WorkspaceExportService {
 			}
 			Files.writeString(ass, out.toString());
 			return ass;
-		} catch (Exception ignored) {
+		} catch (Exception ex) {
+			log.warn("[workspace-export] SRT→ASS rewrite failed; falling back to subtitles filter: {}", ex.toString());
 			return null;
 		}
 	}
@@ -755,6 +786,27 @@ public class WorkspaceExportService {
 			}
 		}
 		return defaultValue;
+	}
+
+	/**
+	 * When the client sends preview canvas metrics, map CSS preview font size to libass {@code FontSize}
+	 * for the probed output frame:
+	 * {@code round(max(10, previewFontPx * max(outW/canvasW, outH/canvasH) * SUBTITLE_PREVIEW_TO_BURN_FONT_FACTOR))}.
+	 * Otherwise use legacy {@code subtitlesFontSize} (clamped 14–96).
+	 */
+	private int resolveSubtitleBurnFontSize(JsonNode payload, int outputVideoW, int outputVideoH) {
+		double previewFontPx = readNumber(payload, "subtitlesPreviewFontPx", -1d);
+		int canvasW = readInt(payload, "subtitlesPreviewCanvasW", -1);
+		int canvasH = readInt(payload, "subtitlesPreviewCanvasH", -1);
+		if (previewFontPx > 0d && canvasW > 0 && canvasH > 0 && outputVideoW > 0 && outputVideoH > 0) {
+			double scaleX = outputVideoW / (double) canvasW;
+			double scaleY = outputVideoH / (double) canvasH;
+			double m = Math.max(scaleX, scaleY);
+			int mapped = (int) Math.round(Math.max(10d, previewFontPx * m * SUBTITLE_PREVIEW_TO_BURN_FONT_FACTOR));
+			return Math.min(280, Math.max(10, mapped));
+		}
+		int legacy = readInt(payload, "subtitlesFontSize", processingProperties.getSubtitlesFontSize());
+		return Math.max(14, Math.min(96, legacy));
 	}
 
 	private String buildAtempoFilter(double speed) {
