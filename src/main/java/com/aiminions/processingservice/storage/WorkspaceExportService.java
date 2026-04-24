@@ -35,6 +35,16 @@ public class WorkspaceExportService {
 	private static final TransliterateZ2U Z2U = new TransliterateZ2U("z2u");
 	private static final Pattern MYANMAR_CHARS = Pattern.compile("[\\u1000-\\u109F\\uAA60-\\uAA7F]");
 
+	/**
+	 * ASS {@code BackColour} for black at UI opacity 0–100 (%). Format {@code &HAABBGGRR}; {@code AA} is 00=opaque, FF=transparent.
+	 */
+	private static String assBackColourBlackFromOpacityPercent(int opacityPercent) {
+		int o = Math.max(0, Math.min(100, opacityPercent));
+		int aa = (int) Math.round(255.0 * (1.0 - o / 100.0));
+		aa = Math.max(0, Math.min(255, aa));
+		return String.format(Locale.ROOT, "&H%02X000000", aa);
+	}
+
 	private final ObjectStorageTransferService objectStorageTransferService;
 	private final FfmpegRunner ffmpegRunner;
 	private final com.aiminions.processingservice.config.ProcessingProperties processingProperties;
@@ -390,6 +400,8 @@ public class WorkspaceExportService {
 			int fontSize = readInt(payload, "subtitlesFontSize", processingProperties.getSubtitlesFontSize());
 			fontSize = Math.max(14, Math.min(60, fontSize));
 			int marginV = Math.max(0, Math.min(300, processingProperties.getSubtitlesMarginV()));
+			int bgOpacity = readInt(payload, "subtitlesBackgroundOpacity", 65);
+			String backColour = assBackColourBlackFromOpacityPercent(bgOpacity);
 			// Force Unicode decoding and prefer a Myanmar Unicode-capable font.
 			// Note: libass uses system fontconfig; if the font isn't installed, it will fall back.
 			String style = "FontName=" + escapeAss(fontName)
@@ -398,7 +410,7 @@ public class WorkspaceExportService {
 					// Outlines can make Myanmar clusters look broken in some libass render paths.
 					// Prefer a background box for readability instead of stroke outline.
 					+ ",BorderStyle=3"
-					+ ",BackColour=&H80000000"
+					+ ",BackColour=" + backColour
 					+ ",Outline=0"
 					+ ",Shadow=0"
 					+ ",Alignment=2"
@@ -437,6 +449,8 @@ public class WorkspaceExportService {
 			int fontSize = readInt(payload, "subtitlesFontSize", processingProperties.getSubtitlesFontSize());
 			fontSize = Math.max(14, Math.min(60, fontSize));
 			int marginV = Math.max(0, Math.min(300, processingProperties.getSubtitlesMarginV()));
+			int bgOpacity = readInt(payload, "subtitlesBackgroundOpacity", 65);
+			String backColour = assBackColourBlackFromOpacityPercent(bgOpacity);
 
 			double posX = readNumber(payload.path("subtitlesPosition"), "x", -1d);
 			double posY = readNumber(payload.path("subtitlesPosition"), "y", -1d);
@@ -454,18 +468,20 @@ public class WorkspaceExportService {
 					line = "PlayResY: " + Math.max(2, videoH);
 				}
 				if (line.startsWith("Style: Default,")) {
-					// ASS style format from ffmpeg: Style: Default,Arial,16,&Hffffff,...
-					// We'll keep colors but force font + size + alignment + margins and disable outline.
+					// ASS style format from ffmpeg (field order): Fontname, Fontsize, Primary, Secondary,
+					// Outline, Back, Bold, Italic, Underline, Strike, ScaleX, ScaleY, Spacing, Angle,
+					// BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 					String[] parts = line.split(",", -1);
 					if (parts.length >= 23) {
 						parts[1] = escapeAssField(fontName);
 						parts[2] = String.valueOf(fontSize);
-						// BorderStyle=3 + BackColour provides readability without outline.
-						parts[16] = "3";           // BorderStyle
-						parts[17] = "0";           // Outline
-						parts[18] = "0";           // Shadow
-						parts[19] = hasPos ? "5" : "2"; // Alignment center (with \pos) or bottom-center
-						parts[22] = String.valueOf(marginV); // MarginV
+						parts[6] = backColour;
+						// BorderStyle=3 + BackColour: opaque box behind text; no outline/shadow.
+						parts[15] = "3";
+						parts[16] = "0";
+						parts[17] = "0";
+						parts[18] = hasPos ? "5" : "2"; // an5 + \pos vs bottom-center
+						parts[21] = String.valueOf(marginV);
 						line = String.join(",", parts);
 					}
 				}
