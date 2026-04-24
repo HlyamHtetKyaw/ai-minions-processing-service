@@ -392,6 +392,8 @@ public class WorkspaceExportService {
 			}
 			if (!textFontsDir.isBlank()) {
 				textAssFilter = textAssFilter + ":fontsdir='" + escapePathForFfmpegFilter(textFontsDir) + "'";
+			} else {
+				log.warn("[workspace-export] text-layer ASS burn-in has no fontsdir (bundled font not extracted); libass may omit glyphs if the face is not on the system font path");
 			}
 			parts.add("[" + current + "]" + textAssFilter + "[" + next + "]");
 			current = next;
@@ -606,8 +608,18 @@ public class WorkspaceExportService {
 			StringBuilder events = new StringBuilder();
 			int emitted = 0;
 			for (JsonNode layer : textLayers) {
-				String content = ensureUnicodeMyanmar(layer.path("content").asText("").trim());
-				if (content.isBlank()) {
+				// Do not trim internal newlines (SRT multi-line cues); only skip truly empty cues.
+				String rawContent = layer.path("content").asText("");
+				String normalized;
+				try {
+					normalized = ensureUnicodeMyanmar(rawContent);
+				} catch (Exception ex) {
+					log.warn("[workspace-export] ensureUnicodeMyanmar failed for a text layer; using raw content: {}", ex.toString());
+					normalized = rawContent;
+				}
+				// If conversion blanked mixed script, keep raw so export still shows Latin / numbers.
+				String content = (normalized != null && !normalized.isBlank()) ? normalized : rawContent;
+				if (content == null || content.isBlank()) {
 					continue;
 				}
 				double start = toExportTime(readNumber(layer, "startTime", 0d), trimStart, safeSpeed);
@@ -617,13 +629,24 @@ public class WorkspaceExportService {
 					continue;
 				}
 
-				int x = (int) Math.round(readNumber(layer, "x", 0d) * scaleX + offsetX);
-				int y = (int) Math.round(readNumber(layer, "y", 0d) * scaleY + offsetY);
-				int fontSize = (int) Math.round(Math.max(10d, readNumber(layer, "fontSize", 24d) * Math.max(scaleX, scaleY)));
+				// Preview: TextLayer centers glyphs in [x,y,width,height] (Rnd box). ASS must use the same anchor:
+				// middle-center + pos at box center, not top-left (\an7), or export position/size diverge from editor.
+				double boxX = readNumber(layer, "x", 0d);
+				double boxY = readNumber(layer, "y", 0d);
+				double boxW = readNumber(layer, "width", 0d);
+				double boxH = readNumber(layer, "height", 0d);
+				double cx = (boxX + Math.max(0d, boxW) / 2d) * scaleX + offsetX;
+				double cy = (boxY + Math.max(0d, boxH) / 2d) * scaleY + offsetY;
+				int posX = (int) Math.round(cx);
+				int posY = (int) Math.round(cy);
+				double sFont = Math.sqrt(Math.max(1e-18d, scaleX * scaleY));
+				int fontSize = (int) Math.round(
+						Math.max(10d, readNumber(layer, "fontSize", 24d) * sFont * SUBTITLE_PREVIEW_TO_BURN_FONT_FACTOR));
+				fontSize = Math.min(280, fontSize);
 				double opacity = Math.max(0d, Math.min(1d, readNumber(layer, "opacity", 100d) / 100d));
 				int alpha = toAssAlpha(opacity);
 				String color = toAssPrimaryColor(readText(layer, "color", "#FFFFFF"));
-				String tags = "{\\an7\\pos(" + x + "," + y + ")\\fs" + fontSize + "\\1c" + color
+				String tags = "{\\an5\\pos(" + posX + "," + posY + ")\\fs" + fontSize + "\\1c" + color
 						+ "\\1a&H" + String.format(Locale.US, "%02X", alpha) + "&}";
 				String text = escapeAssDialogueText(content);
 				events.append("Dialogue: 0,")
@@ -636,18 +659,22 @@ public class WorkspaceExportService {
 						.append('\n');
 				emitted++;
 			}
-			if (emitted == 0) return null;
+			if (emitted == 0) {
+				log.warn("[workspace-export] textLayers array non-empty but no dialogue lines emitted (check timing vs trim, or blank content)");
+				return null;
+			}
 
 			StringBuilder ass = new StringBuilder();
+			// BorderStyle=3 with Outline=0 often yields invisible libass output; use outline style so burns match preview.
 			ass.append("[Script Info]\n")
 					.append("ScriptType: v4.00+\n")
 					.append("PlayResX: ").append(Math.max(2, videoW)).append('\n')
 					.append("PlayResY: ").append(Math.max(2, videoH)).append('\n')
-					.append("WrapStyle: 2\n")
+					.append("WrapStyle: 0\n")
 					.append("ScaledBorderAndShadow: yes\n\n")
 					.append("[V4+ Styles]\n")
 					.append("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n")
-					.append("Style: Default,").append(escapeAssField(fontName)).append(",24,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,3,0,0,7,0,0,")
+					.append("Style: Default,").append(escapeAssField(fontName)).append(",24,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,0,7,0,0,")
 					.append(marginV)
 					.append(",1\n\n")
 					.append("[Events]\n")
@@ -702,7 +729,14 @@ public class WorkspaceExportService {
 		double zawgyiProb = ZAWGYI_DETECTOR.getZawgyiProbability(my);
 		// Lower threshold: better to convert than to ship broken burn-in.
 		if (zawgyiProb >= 0.20d) {
-			return Z2U.convert(line);
+			try {
+				String converted = Z2U.convert(line);
+				return converted != null && !converted.isBlank() ? converted : line;
+			} catch (Exception ex) {
+				org.slf4j.LoggerFactory.getLogger(WorkspaceExportService.class)
+						.warn("[workspace-export] Zawgyi→Unicode conversion failed for a line; using original: {}", ex.toString());
+				return line;
+			}
 		}
 		return line;
 	}
@@ -945,13 +979,24 @@ public class WorkspaceExportService {
 		return (int) Math.round((1d - clamped) * 255d);
 	}
 
+	private static String normalizeAssDialogueNewlines(String value) {
+		if (value == null || value.isEmpty()) {
+			return "";
+		}
+		// Unicode line/paragraph separators (common in pasted SRT) and all CR variants → LF before ASS \N.
+		return value
+				.replace("\u2028", "\n")
+				.replace("\u2029", "\n")
+				.replace("\r\n", "\n")
+				.replace('\r', '\n');
+	}
+
 	private static String escapeAssDialogueText(String value) {
-		String t = value == null ? "" : value;
+		String t = normalizeAssDialogueNewlines(value);
 		return t
 				.replace("\\", "\\\\")
 				.replace("{", "\\{")
 				.replace("}", "\\}")
-				.replace("\r", "")
 				.replace("\n", "\\N");
 	}
 
