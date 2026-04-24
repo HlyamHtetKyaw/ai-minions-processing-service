@@ -312,11 +312,13 @@ public class WorkspaceExportService {
 			current = next;
 		}
 
+		String drawtextFontfile = resolveBundledDrawtextFontfileForFilter(workDir);
+
 		JsonNode textLayers = payload.path("textLayers");
 		if (textLayers.isArray()) {
 			int idx = 0;
 			for (JsonNode layer : textLayers) {
-				String text = layer.path("content").asText("").trim();
+				String text = ensureUnicodeMyanmar(layer.path("content").asText("").trim());
 				if (text.isEmpty()) {
 					continue;
 				}
@@ -332,7 +334,8 @@ public class WorkspaceExportService {
 				double opacity = Math.max(0d, Math.min(1d, readNumber(layer, "opacity", 100d) / 100d));
 				String color = toFfmpegColor(readText(layer, "color", "#FFFFFF"), opacity);
 				String next = "vt" + idx;
-				parts.add("[" + current + "]drawtext=text='" + escapeText(text) + "':x=" + x + ":y=" + y
+				String fontPrefix = drawtextFontfile.isBlank() ? "" : "fontfile='" + drawtextFontfile + "':";
+				parts.add("[" + current + "]drawtext=" + fontPrefix + "text='" + escapeText(text) + "':x=" + x + ":y=" + y
 						+ ":fontsize=" + fontSize + ":fontcolor=" + color
 						+ ":enable='between(t," + formatDecimal(start) + "," + formatDecimal(end) + ")'"
 						+ "[" + next + "]");
@@ -568,6 +571,43 @@ public class WorkspaceExportService {
 		if (v == null) return "";
 		// ASS force_style string is single-quoted in ffmpeg filter; escape quotes/backslashes.
 		return v.replace("\\", "\\\\").replace("'", "\\'");
+	}
+
+	/**
+	 * Same bundled TTF as subtitle burn-in (see {@link #extractBundledFontDir}). FFmpeg {@code drawtext}
+	 * does not use libass/fontconfig here — without {@code fontfile}, Myanmar glyphs are often missing.
+	 */
+	private String resolveBundledDrawtextFontfileForFilter(Path workDir) {
+		if (workDir == null) {
+			return "";
+		}
+		try {
+			extractBundledFontDir(workDir);
+			String res = processingProperties.getSubtitlesFontResource();
+			if (res == null || res.isBlank()) {
+				return "";
+			}
+			String fileName = Path.of(res).getFileName().toString();
+			if (fileName.isBlank()) {
+				return "";
+			}
+			Path fontPath = workDir.resolve("fonts").resolve(fileName);
+			if (!Files.exists(fontPath)) {
+				log.warn("[workspace-export] drawtext font not found at {} (resource={})", fontPath, res);
+				return "";
+			}
+			return escapePathForFfmpegFilter(fontPath.toString());
+		} catch (Exception e) {
+			log.warn("[workspace-export] could not resolve drawtext fontfile", e);
+			return "";
+		}
+	}
+
+	private static String escapePathForFfmpegFilter(String path) {
+		if (path == null) {
+			return "";
+		}
+		return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'");
 	}
 
 	private String extractBundledFontDir(Path workDir) {
