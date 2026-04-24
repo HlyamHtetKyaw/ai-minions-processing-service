@@ -281,8 +281,14 @@ public class WorkspaceExportService {
 		double selectedDuration = trimEnd > trimStart ? trimEnd - trimStart : Math.max(0d, rawDuration - trimStart);
 		double exportedDuration = Math.max(0.01d, selectedDuration / safeSpeed);
 
-		double scaleX = readNumber(payload.path("displayToNaturalScale"), "x", 1d);
-		double scaleY = readNumber(payload.path("displayToNaturalScale"), "y", 1d);
+		double baseScaleX = readNumber(payload.path("displayToNaturalScale"), "x", 1d);
+		double baseScaleY = readNumber(payload.path("displayToNaturalScale"), "y", 1d);
+		double layerScaleX = baseScaleX;
+		double layerScaleY = baseScaleY;
+		double layerOffsetX = 0d;
+		double layerOffsetY = 0d;
+		int outputVideoW = videoW;
+		int outputVideoH = videoH;
 
 		String current = "v0";
 		parts.add("[0:v]setpts=" + formatDecimal(1d / safeSpeed) + "*PTS[" + current + "]");
@@ -302,36 +308,57 @@ public class WorkspaceExportService {
 			current = next;
 		}
 
-		String drawtextFontfile = resolveBundledDrawtextFontfileForFilter(workDir);
-
-		JsonNode textLayers = payload.path("textLayers");
-		if (textLayers.isArray()) {
-			int idx = 0;
-			for (JsonNode layer : textLayers) {
-				String text = ensureUnicodeMyanmar(layer.path("content").asText("").trim());
-				if (text.isEmpty()) {
-					continue;
-				}
-				double start = toExportTime(readNumber(layer, "startTime", 0d), trimStart, safeSpeed);
-				double end = toExportTime(readNumber(layer, "endTime", exportedDuration), trimStart, safeSpeed);
-				end = Math.min(exportedDuration, end);
-				if (end <= start) {
-					continue;
-				}
-				int x = (int) Math.round(readNumber(layer, "x", 0d) * scaleX);
-				int y = (int) Math.round(readNumber(layer, "y", 0d) * scaleY);
-				int fontSize = (int) Math.round(Math.max(10d, readNumber(layer, "fontSize", 24d) * Math.max(scaleX, scaleY)));
-				double opacity = Math.max(0d, Math.min(1d, readNumber(layer, "opacity", 100d) / 100d));
-				String color = toFfmpegColor(readText(layer, "color", "#FFFFFF"), opacity);
-				String next = "vt" + idx;
-				String fontPrefix = drawtextFontfile.isBlank() ? "" : "fontfile='" + drawtextFontfile + "':";
-				parts.add("[" + current + "]drawtext=" + fontPrefix + "text='" + escapeText(text) + "':x=" + x + ":y=" + y
-						+ ":fontsize=" + fontSize + ":fontcolor=" + color
-						+ ":enable='between(t," + formatDecimal(start) + "," + formatDecimal(end) + ")'"
-						+ "[" + next + "]");
-				current = next;
-				idx++;
+		// Respect workspace aspect (e.g. 9:16 portrait) for export output.
+		// We mimic preview's cover behavior by center-cropping the source to the selected canvas ratio.
+		double sourceAspect = videoH > 0 ? (double) videoW / (double) videoH : 1d;
+		double targetAspect = resolveTargetAspectRatio(payload, sourceAspect);
+		if (Math.abs(sourceAspect - targetAspect) > 0.0001d && videoW > 1 && videoH > 1) {
+			int cropW = videoW;
+			int cropH = videoH;
+			int cropX = 0;
+			int cropY = 0;
+			if (sourceAspect > targetAspect) {
+				cropW = evenAtLeast2((int) Math.floor(videoH * targetAspect));
+				cropW = Math.min(cropW, evenAtLeast2(videoW));
+				cropX = evenNonNegative((videoW - cropW) / 2);
+			} else {
+				cropH = evenAtLeast2((int) Math.floor(videoW / targetAspect));
+				cropH = Math.min(cropH, evenAtLeast2(videoH));
+				cropY = evenNonNegative((videoH - cropH) / 2);
 			}
+			outputVideoW = cropW;
+			outputVideoH = cropH;
+			layerScaleX = baseScaleX * ((double) cropW / (double) videoW);
+			layerScaleY = baseScaleY * ((double) cropH / (double) videoH);
+			layerOffsetX = -cropX;
+			layerOffsetY = -cropY;
+			String next = "vaspect";
+			parts.add("[" + current + "]crop=" + cropW + ":" + cropH + ":" + cropX + ":" + cropY + "[" + next + "]");
+			current = next;
+		}
+
+		// Viral-style text burn-in: write text layers to ASS and burn with complex shaping.
+		Path textLayersAss = maybeWriteTextLayersAss(
+				payload, workDir, trimStart, safeSpeed, exportedDuration,
+				layerScaleX, layerScaleY, layerOffsetX, layerOffsetY,
+				outputVideoW, outputVideoH
+		);
+		if (textLayersAss != null) {
+			String next = "vtass";
+			String escapedTextAss = escapePathForFfmpegFilter(textLayersAss.toString());
+			String textAssFilter = "ass='" + escapedTextAss + "':shaping=complex:original_size=" + outputVideoW + "x" + outputVideoH;
+			String textFontsDir = "";
+			if (workDir != null) {
+				textFontsDir = extractBundledFontDir(workDir);
+			}
+			if (textFontsDir.isBlank()) {
+				textFontsDir = processingProperties.getSubtitlesFontsDir() == null ? "" : processingProperties.getSubtitlesFontsDir().trim();
+			}
+			if (!textFontsDir.isBlank()) {
+				textAssFilter = textAssFilter + ":fontsdir='" + escapePathForFfmpegFilter(textFontsDir) + "'";
+			}
+			parts.add("[" + current + "]" + textAssFilter + "[" + next + "]");
+			current = next;
 		}
 
 		for (int i = 0; i < images.size(); i++) {
@@ -343,10 +370,10 @@ public class WorkspaceExportService {
 			if (end <= start) {
 				continue;
 			}
-			int width = Math.max(2, (int) Math.round(readNumber(layer, "width", 100d) * scaleX));
-			int height = Math.max(2, (int) Math.round(readNumber(layer, "height", 100d) * scaleY));
-			int x = (int) Math.round(readNumber(layer, "x", 0d) * scaleX);
-			int y = (int) Math.round(readNumber(layer, "y", 0d) * scaleY);
+			int width = Math.max(2, (int) Math.round(readNumber(layer, "width", 100d) * layerScaleX));
+			int height = Math.max(2, (int) Math.round(readNumber(layer, "height", 100d) * layerScaleY));
+			int x = (int) Math.round(readNumber(layer, "x", 0d) * layerScaleX + layerOffsetX);
+			int y = (int) Math.round(readNumber(layer, "y", 0d) * layerScaleY + layerOffsetY);
 			double opacity = Math.max(0d, Math.min(1d, readNumber(layer, "opacity", 1d)));
 			boolean flipX = readBoolean(layer, "flipX", false);
 			boolean flipY = readBoolean(layer, "flipY", false);
@@ -379,7 +406,7 @@ public class WorkspaceExportService {
 		if (srtFile != null) {
 			String next = "vsrt";
 			// Convert SRT -> ASS and burn via ass filter with complex shaping for Myanmar.
-			Path assFile = maybeConvertSrtToAss(srtFile, workDir, payload, videoW, videoH);
+			Path assFile = maybeConvertSrtToAss(srtFile, workDir, payload, outputVideoW, outputVideoH);
 			Path burnFile = assFile != null ? assFile : srtFile;
 			String escaped = burnFile.toString().replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'");
 			// Prefer bundled font dir for deterministic production output.
@@ -414,7 +441,7 @@ public class WorkspaceExportService {
 
 			String filter;
 			if (burnFile.toString().toLowerCase(Locale.ROOT).endsWith(".ass")) {
-				filter = "ass='" + escaped + "':shaping=complex:original_size=" + videoW + "x" + videoH;
+				filter = "ass='" + escaped + "':shaping=complex:original_size=" + outputVideoW + "x" + outputVideoH;
 			} else {
 				filter = "subtitles='" + escaped + "':charenc=UTF-8:wrap_unicode=1:force_style='" + style + "'";
 			}
@@ -507,6 +534,88 @@ public class WorkspaceExportService {
 		return v.replace(",", " ");
 	}
 
+	private Path maybeWriteTextLayersAss(
+			JsonNode payload,
+			Path workDir,
+			double trimStart,
+			double safeSpeed,
+			double exportedDuration,
+			double scaleX,
+			double scaleY,
+			double offsetX,
+			double offsetY,
+			int videoW,
+			int videoH
+	) {
+		try {
+			if (payload == null || payload.isNull() || workDir == null) return null;
+			JsonNode textLayers = payload.path("textLayers");
+			if (!textLayers.isArray() || textLayers.isEmpty()) return null;
+
+			String fontName = processingProperties.getSubtitlesFontName() == null ? "" : processingProperties.getSubtitlesFontName().trim();
+			if (fontName.isBlank()) fontName = "Pyidaungsu";
+			int marginV = Math.max(0, Math.min(300, processingProperties.getSubtitlesMarginV()));
+
+			StringBuilder events = new StringBuilder();
+			int emitted = 0;
+			for (JsonNode layer : textLayers) {
+				String content = ensureUnicodeMyanmar(layer.path("content").asText("").trim());
+				if (content.isBlank()) {
+					continue;
+				}
+				double start = toExportTime(readNumber(layer, "startTime", 0d), trimStart, safeSpeed);
+				double end = toExportTime(readNumber(layer, "endTime", exportedDuration), trimStart, safeSpeed);
+				end = Math.min(exportedDuration, end);
+				if (end <= start) {
+					continue;
+				}
+
+				int x = (int) Math.round(readNumber(layer, "x", 0d) * scaleX + offsetX);
+				int y = (int) Math.round(readNumber(layer, "y", 0d) * scaleY + offsetY);
+				int fontSize = (int) Math.round(Math.max(10d, readNumber(layer, "fontSize", 24d) * Math.max(scaleX, scaleY)));
+				double opacity = Math.max(0d, Math.min(1d, readNumber(layer, "opacity", 100d) / 100d));
+				int alpha = toAssAlpha(opacity);
+				String color = toAssPrimaryColor(readText(layer, "color", "#FFFFFF"));
+				String tags = "{\\an7\\pos(" + x + "," + y + ")\\fs" + fontSize + "\\1c" + color
+						+ "\\1a&H" + String.format(Locale.US, "%02X", alpha) + "&}";
+				String text = escapeAssDialogueText(content);
+				events.append("Dialogue: 0,")
+						.append(formatAssTime(start))
+						.append(",")
+						.append(formatAssTime(end))
+						.append(",Default,,0,0,0,,")
+						.append(tags)
+						.append(text)
+						.append('\n');
+				emitted++;
+			}
+			if (emitted == 0) return null;
+
+			StringBuilder ass = new StringBuilder();
+			ass.append("[Script Info]\n")
+					.append("ScriptType: v4.00+\n")
+					.append("PlayResX: ").append(Math.max(2, videoW)).append('\n')
+					.append("PlayResY: ").append(Math.max(2, videoH)).append('\n')
+					.append("WrapStyle: 2\n")
+					.append("ScaledBorderAndShadow: yes\n\n")
+					.append("[V4+ Styles]\n")
+					.append("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n")
+					.append("Style: Default,").append(escapeAssField(fontName)).append(",24,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,3,0,0,7,0,0,")
+					.append(marginV)
+					.append(",1\n\n")
+					.append("[Events]\n")
+					.append("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+					.append(events);
+
+			Path assFile = workDir.resolve("workspace-text-layers.ass");
+			Files.writeString(assFile, ass.toString());
+			return assFile;
+		} catch (Exception e) {
+			log.warn("[workspace-export] failed to build text-layer ASS", e);
+			return null;
+		}
+	}
+
 	private Path maybeWriteSrtFile(JsonNode payload, Path workDir) throws IOException {
 		if (payload == null || payload.isNull()) return null;
 		boolean burn = readBoolean(payload, "burnSubtitles", false);
@@ -557,41 +666,34 @@ public class WorkspaceExportService {
 		return v.replace("\\", "\\\\").replace("'", "\\'");
 	}
 
-	/**
-	 * Same bundled TTF as subtitle burn-in (see {@link #extractBundledFontDir}). FFmpeg {@code drawtext}
-	 * does not use libass/fontconfig here — without {@code fontfile}, Myanmar glyphs are often missing.
-	 */
-	private String resolveBundledDrawtextFontfileForFilter(Path workDir) {
-		if (workDir == null) {
-			return "";
-		}
-		try {
-			extractBundledFontDir(workDir);
-			String res = processingProperties.getSubtitlesFontResource();
-			if (res == null || res.isBlank()) {
-				return "";
-			}
-			String fileName = Path.of(res).getFileName().toString();
-			if (fileName.isBlank()) {
-				return "";
-			}
-			Path fontPath = workDir.resolve("fonts").resolve(fileName);
-			if (!Files.exists(fontPath)) {
-				log.warn("[workspace-export] drawtext font not found at {} (resource={})", fontPath, res);
-				return "";
-			}
-			return escapePathForFfmpegFilter(fontPath.toString());
-		} catch (Exception e) {
-			log.warn("[workspace-export] could not resolve drawtext fontfile", e);
-			return "";
-		}
-	}
-
 	private static String escapePathForFfmpegFilter(String path) {
 		if (path == null) {
 			return "";
 		}
 		return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'");
+	}
+
+	private static int evenAtLeast2(int value) {
+		int v = Math.max(2, value);
+		return (v & 1) == 0 ? v : v - 1;
+	}
+
+	private static int evenNonNegative(int value) {
+		int v = Math.max(0, value);
+		return (v & 1) == 0 ? v : v - 1;
+	}
+
+	private double resolveTargetAspectRatio(JsonNode payload, double fallbackAspect) {
+		double fromCrop = readNumber(payload.path("crop"), "easyAspect", fallbackAspect);
+		if (Double.isFinite(fromCrop) && fromCrop > 0.01d && fromCrop < 100d) {
+			return fromCrop;
+		}
+		double cw = readNumber(payload.path("canvasFrame"), "width", 0d);
+		double ch = readNumber(payload.path("canvasFrame"), "height", 0d);
+		if (Double.isFinite(cw) && Double.isFinite(ch) && cw > 1d && ch > 1d) {
+			return cw / ch;
+		}
+		return fallbackAspect > 0 ? fallbackAspect : 1d;
 	}
 
 	private String extractBundledFontDir(Path workDir) {
@@ -756,26 +858,56 @@ public class WorkspaceExportService {
 		return String.join(",", chain);
 	}
 
-	private String toFfmpegColor(String raw, double alpha) {
-		String c = raw == null ? "#FFFFFF" : raw.trim();
-		if (c.isEmpty()) {
-			c = "#FFFFFF";
+	private static String toAssPrimaryColor(String raw) {
+		String hex = raw == null ? "FFFFFF" : raw.trim();
+		if (hex.startsWith("#")) {
+			hex = hex.substring(1);
 		}
-		if (c.startsWith("#")) {
-			return c + "@" + formatDecimal(alpha);
+		if (!hex.matches("(?i)[0-9a-f]{6}")) {
+			hex = "FFFFFF";
 		}
-		return c + "@" + formatDecimal(alpha);
+		String rr = hex.substring(0, 2);
+		String gg = hex.substring(2, 4);
+		String bb = hex.substring(4, 6);
+		return "&H" + bb + gg + rr + "&";
 	}
 
-	private String escapeText(String value) {
+	private static int toAssAlpha(double opacity) {
+		double clamped = Math.max(0d, Math.min(1d, opacity));
+		return (int) Math.round((1d - clamped) * 255d);
+	}
+
+	private static String escapeAssDialogueText(String value) {
 		String t = value == null ? "" : value;
 		return t
 				.replace("\\", "\\\\")
-				.replace(":", "\\:")
-				.replace("'", "\\'")
-				.replace("%", "\\%")
-				.replace("\n", "\\n")
-				.replace("\r", "");
+				.replace("{", "\\{")
+				.replace("}", "\\}")
+				.replace("\r", "")
+				.replace("\n", "\\N");
+	}
+
+	private static String formatAssTime(double seconds) {
+		double s = Math.max(0d, Double.isFinite(seconds) ? seconds : 0d);
+		int hours = (int) Math.floor(s / 3600d);
+		s -= hours * 3600d;
+		int minutes = (int) Math.floor(s / 60d);
+		s -= minutes * 60d;
+		int secs = (int) Math.floor(s);
+		int centis = (int) Math.round((s - secs) * 100d);
+		if (centis >= 100) {
+			centis = 0;
+			secs++;
+		}
+		if (secs >= 60) {
+			secs = 0;
+			minutes++;
+		}
+		if (minutes >= 60) {
+			minutes = 0;
+			hours++;
+		}
+		return String.format(Locale.US, "%d:%02d:%02d.%02d", hours, minutes, secs, centis);
 	}
 
 	private String formatDecimal(double value) {
