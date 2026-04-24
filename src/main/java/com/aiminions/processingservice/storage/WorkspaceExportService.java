@@ -53,7 +53,7 @@ public class WorkspaceExportService {
 		if (payload == null || payload.isNull()) {
 			throw new ResponseStatusException(BAD_REQUEST, "payload is required");
 		}
-		String videoUrl = readRequiredText(payload, "videoUrl");
+		String videoUrl = ObjectStorageTransferService.stripUrlFragmentForDownload(readRequiredText(payload, "videoUrl"));
 		double trimStart = readNumber(payload, "trimStart", 0d);
 		double trimEnd = readNumber(payload, "trimEnd", 0d);
 		double speed = readNumber(payload, "speed", 1d);
@@ -78,7 +78,12 @@ public class WorkspaceExportService {
 		} catch (ResponseStatusException ex) {
 			throw ex;
 		} catch (Exception ex) {
-			throw new ResponseStatusException(INTERNAL_SERVER_ERROR, "Failed to export workspace video", ex);
+			log.error("Workspace export failed for userId={}", userId, ex);
+			String reason = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
+			if (reason.length() > 800) {
+				reason = reason.substring(0, 800) + "…";
+			}
+			throw new ResponseStatusException(INTERNAL_SERVER_ERROR, "Failed to export workspace video: " + reason, ex);
 		} finally {
 			if (workDir != null) {
 				try {
@@ -612,17 +617,21 @@ public class WorkspaceExportService {
 		if (!imageLayers.isArray()) {
 			return out;
 		}
-		int idx = 0;
 		for (JsonNode layer : imageLayers) {
-			String src = readText(layer, "src", "");
-			if (src.isBlank()) {
+			String src = ObjectStorageTransferService.stripUrlFragmentForDownload(readText(layer, "src", ""));
+			if (src == null || src.isBlank()) {
 				continue;
 			}
-			Path downloaded = objectStorageTransferService.download(src, workDir);
-			Path normalized = workDir.resolve("layer-image-" + idx + ".png");
-			ffmpegRunner.run(List.of("-y", "-i", downloaded.toString(), "-frames:v", "1", normalized.toString()));
-			out.add(new ImageInput(layer, normalized));
-			idx++;
+			try {
+				Path downloaded = objectStorageTransferService.download(src, workDir);
+				Path normalized = workDir.resolve("layer-image-" + out.size() + ".png");
+				ffmpegRunner.run(
+						List.of("-y", "-i", downloaded.toString(), "-frames:v", "1", normalized.toString()));
+				out.add(new ImageInput(layer, normalized));
+			} catch (Exception e) {
+				// Many external hosts (e.g. Pinterest) block non-browser fetches. Skip overlay instead of failing export.
+				log.warn("Skipping image overlay; could not download or decode: {}", src, e);
+			}
 		}
 		return out;
 	}
