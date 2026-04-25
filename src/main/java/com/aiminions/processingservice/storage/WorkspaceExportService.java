@@ -17,6 +17,7 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.regex.Pattern;
@@ -140,34 +141,56 @@ public class WorkspaceExportService {
 			Path srtFile
 	) throws IOException, InterruptedException {
 		int[] size = probeVideoSize(input);
+		ExportSegmentPlan plan = buildExportSegmentPlan(payload, trimStart, trimEnd, speed);
+		boolean muted = readBoolean(payload.path("originalAudio"), "muted", false);
+		double originalVol = readNumber(payload.path("originalAudio"), "volume", 100d) / 100d;
+		boolean hasAudio = probeHasAudio(input);
+		boolean audioFromGraph = plan.multi() && !muted && hasAudio;
+
 		List<String> args = new ArrayList<>();
 		args.add("-y");
-		if (trimStart > 0) {
-			args.add("-ss");
-			args.add(formatDecimal(trimStart));
-		}
-		args.add("-i");
-		args.add(input.toString());
-		if (trimEnd > trimStart && trimEnd > 0) {
-			args.add("-t");
-			args.add(formatDecimal(trimEnd - Math.max(0d, trimStart)));
+		if (!plan.multi()) {
+			double t0 = plan.segments().get(0)[0];
+			if (t0 > 0) {
+				args.add("-ss");
+				args.add(formatDecimal(t0));
+			}
+			args.add("-i");
+			args.add(input.toString());
+			double t1 = plan.segments().get(0)[1];
+			if (t1 > t0 && t1 > 0) {
+				args.add("-t");
+				args.add(formatDecimal(t1 - Math.max(0d, t0)));
+			}
+		} else {
+			args.add("-i");
+			args.add(input.toString());
 		}
 
 		List<ImageInput> images = collectImageInputs(payload, workDir);
 		for (ImageInput image : images) {
+			if (image.loopInput()) {
+				args.add("-stream_loop");
+				args.add("-1");
+			}
 			args.add("-i");
 			args.add(image.path().toString());
 		}
 
-		String filterComplex = buildFilterComplex(payload, trimStart, trimEnd, speed, images, srtFile, workDir, size[0], size[1]);
+		String filterComplex = buildFilterComplex(
+				payload, plan, images, srtFile, workDir, size[0], size[1], audioFromGraph, originalVol);
 		args.add("-filter_complex");
 		args.add(filterComplex);
 		args.add("-map");
 		args.add("[vout]");
 
-		boolean muted = readBoolean(payload.path("originalAudio"), "muted", false);
-		double originalVol = readNumber(payload.path("originalAudio"), "volume", 100d) / 100d;
 		if (muted) {
+			args.add("-an");
+		} else if (audioFromGraph) {
+			args.add("-map");
+			args.add("[aout]");
+		} else if (plan.multi()) {
+			// Disjoint kept spans: without a decodable audio stream we cannot align 0:a to the concat video.
 			args.add("-an");
 		} else {
 			args.add("-map");
@@ -249,6 +272,129 @@ public class WorkspaceExportService {
 		return new int[]{1080, 1920};
 	}
 
+	private boolean probeHasAudio(Path input) {
+		try {
+			var r = ffmpegRunner.runRaw(List.of("-hide_banner", "-i", input.toString()), 30, java.util.concurrent.TimeUnit.SECONDS);
+			String out = r.output() == null ? "" : r.output();
+			for (String line : out.split("\\R")) {
+				if (line.contains("Audio:")) {
+					return true;
+				}
+			}
+			return false;
+		} catch (Exception ignored) {
+			return false;
+		}
+	}
+
+	private record ExportSegmentPlan(List<double[]> segments, double safeSpeed, double exportedDuration) {
+		boolean multi() {
+			return segments.size() >= 2;
+		}
+	}
+
+	private ExportSegmentPlan buildExportSegmentPlan(JsonNode payload, double trimStart, double trimEnd, double speed) {
+		double safeSpeed = Math.abs(speed) < 0.0001d ? 1d : speed;
+		double rawDuration = readNumber(payload, "duration", 0d);
+		List<double[]> segs = parseVideoTimelineKeepSegments(payload, rawDuration, trimStart, trimEnd);
+		double sumLen = 0d;
+		for (double[] s : segs) {
+			sumLen += Math.max(0d, s[1] - s[0]);
+		}
+		double exportedDuration = Math.max(0.01d, sumLen / safeSpeed);
+		return new ExportSegmentPlan(List.copyOf(segs), safeSpeed, exportedDuration);
+	}
+
+	private static List<double[]> mergeOverlappingKeepSegments(List<double[]> sorted) {
+		List<double[]> out = new ArrayList<>();
+		for (double[] s : sorted) {
+			if (s[1] <= s[0] + 1e-6d) {
+				continue;
+			}
+			if (out.isEmpty()) {
+				out.add(new double[]{s[0], s[1]});
+				continue;
+			}
+			double[] last = out.get(out.size() - 1);
+			if (s[0] <= last[1] + 1e-4d) {
+				last[1] = Math.max(last[1], s[1]);
+			} else {
+				out.add(new double[]{s[0], s[1]});
+			}
+		}
+		return out;
+	}
+
+	private List<double[]> parseVideoTimelineKeepSegments(JsonNode payload, double duration, double trimStart, double trimEnd) {
+		List<double[]> raw = new ArrayList<>();
+		JsonNode arr = payload.path("videoTimelineSegments");
+		if (arr != null && arr.isArray() && !arr.isEmpty()) {
+			double dMax = Math.max(0d, duration);
+			for (JsonNode el : arr) {
+				double st = readNumber(el, "startTime", 0d);
+				double en = readNumber(el, "endTime", 0d);
+				if (en <= st + 1e-6d) {
+					continue;
+				}
+				st = Math.max(0d, st);
+				if (dMax > 1e-6d) {
+					en = Math.min(dMax, en);
+				}
+				if (en > st + 1e-6d) {
+					raw.add(new double[]{st, en});
+				}
+			}
+			raw.sort(Comparator.comparingDouble(a -> a[0]));
+			raw = mergeOverlappingKeepSegments(raw);
+		}
+		if (raw.isEmpty()) {
+			double t0 = Math.max(0d, trimStart);
+			double t1 = trimEnd > t0 ? trimEnd : (duration > 1e-6d ? duration : t0);
+			if (t1 <= t0 + 1e-6d && duration > 1e-6d) {
+				t1 = duration;
+			}
+			raw.add(new double[]{t0, Math.max(t0 + 1e-3d, t1)});
+		}
+		return raw;
+	}
+
+	private double sourceTimeToExport(ExportSegmentPlan plan, double sourceTime) {
+		double t = sourceTime;
+		double acc = 0d;
+		for (double[] s : plan.segments()) {
+			if (t <= s[0] + 1e-9d) {
+				return acc;
+			}
+			if (t < s[1] - 1e-9d) {
+				return acc + (t - s[0]) / plan.safeSpeed();
+			}
+			acc += (s[1] - s[0]) / plan.safeSpeed();
+		}
+		return acc;
+	}
+
+	private String overlayEnableFromSourceWindow(ExportSegmentPlan plan, double sourceStart, double sourceEnd, double exportedDuration) {
+		List<String> terms = new ArrayList<>();
+		for (double[] s : plan.segments()) {
+			double cs = Math.max(sourceStart, s[0]);
+			double ce = Math.min(sourceEnd, s[1]);
+			if (ce <= cs + 1e-6d) {
+				continue;
+			}
+			double os = sourceTimeToExport(plan, cs);
+			double oe = sourceTimeToExport(plan, ce);
+			oe = Math.min(exportedDuration, oe);
+			if (oe <= os + 1e-6d) {
+				continue;
+			}
+			terms.add("between(t," + formatDecimal(os) + "," + formatDecimal(oe) + ")");
+		}
+		if (terms.isEmpty()) {
+			return null;
+		}
+		return String.join("+", terms);
+	}
+
 	private static void logFontSelection(String ffmpegOut) {
 		if (ffmpegOut == null || ffmpegOut.isBlank()) return;
 		// libass prints font selection lines in verbose mode.
@@ -302,20 +448,19 @@ public class WorkspaceExportService {
 
 	private String buildFilterComplex(
 			JsonNode payload,
-			double trimStart,
-			double trimEnd,
-			double speed,
+			ExportSegmentPlan plan,
 			List<ImageInput> images,
 			Path srtFile,
 			Path workDir,
 			int videoW,
-			int videoH
+			int videoH,
+			boolean buildConcatAudioInGraph,
+			double originalVolume
 	) {
 		List<String> parts = new ArrayList<>();
-		double safeSpeed = Math.abs(speed) < 0.0001d ? 1d : speed;
+		double safeSpeed = plan.safeSpeed();
+		double exportedDuration = plan.exportedDuration();
 		double rawDuration = readNumber(payload, "duration", 0d);
-		double selectedDuration = trimEnd > trimStart ? trimEnd - trimStart : Math.max(0d, rawDuration - trimStart);
-		double exportedDuration = Math.max(0.01d, selectedDuration / safeSpeed);
 
 		double baseScaleX = readNumber(payload.path("displayToNaturalScale"), "x", 1d);
 		double baseScaleY = readNumber(payload.path("displayToNaturalScale"), "y", 1d);
@@ -326,8 +471,39 @@ public class WorkspaceExportService {
 		int outputVideoW = videoW;
 		int outputVideoH = videoH;
 
-		String current = "v0";
-		parts.add("[0:v]setpts=" + formatDecimal(1d / safeSpeed) + "*PTS[" + current + "]");
+		String current;
+		if (plan.multi()) {
+			List<String> vLabels = new ArrayList<>();
+			List<double[]> segs = plan.segments();
+			int n = segs.size();
+			for (int i = 0; i < n; i++) {
+				double a = segs.get(i)[0];
+				double b = segs.get(i)[1];
+				String vLab = "vx" + i;
+				parts.add("[0:v]trim=start=" + formatDecimal(a) + ":end=" + formatDecimal(b)
+						+ ",setpts=PTS-STARTPTS,setpts=" + formatDecimal(1d / safeSpeed) + "*PTS[" + vLab + "]");
+				vLabels.add("[" + vLab + "]");
+			}
+			parts.add(String.join("", vLabels) + "concat=n=" + n + ":v=1:a=0[vcat]");
+			current = "vcat";
+			if (buildConcatAudioInGraph) {
+				List<String> aLabels = new ArrayList<>();
+				for (int i = 0; i < n; i++) {
+					double a = segs.get(i)[0];
+					double b = segs.get(i)[1];
+					String aLab = "ax" + i;
+					String tempoChain = buildAtempoFilter(safeSpeed);
+					parts.add("[0:a]atrim=start=" + formatDecimal(a) + ":end=" + formatDecimal(b)
+							+ ",asetpts=PTS-STARTPTS," + tempoChain + "[" + aLab + "]");
+					aLabels.add("[" + aLab + "]");
+				}
+				parts.add(String.join("", aLabels) + "concat=n=" + n + ":v=0:a=1[acat]");
+				parts.add("[acat]volume=" + formatDecimal(Math.max(0d, originalVolume)) + "[aout]");
+			}
+		} else {
+			current = "v0";
+			parts.add("[0:v]setpts=" + formatDecimal(1d / safeSpeed) + "*PTS[" + current + "]");
+		}
 
 		boolean protectFlip = readBoolean(payload, "protectFlip", false);
 		double protectHueDeg = readNumber(payload, "protectHueDeg", 0d);
@@ -375,7 +551,7 @@ public class WorkspaceExportService {
 
 		// Viral-style text burn-in: write text layers to ASS and burn with complex shaping.
 		Path textLayersAss = maybeWriteTextLayersAss(
-				payload, workDir, trimStart, safeSpeed, exportedDuration,
+				payload, workDir, plan,
 				layerScaleX, layerScaleY, layerOffsetX, layerOffsetY,
 				outputVideoW, outputVideoH
 		);
@@ -402,10 +578,10 @@ public class WorkspaceExportService {
 		for (int i = 0; i < images.size(); i++) {
 			ImageInput imageInput = images.get(i);
 			JsonNode layer = imageInput.layer();
-			double start = toExportTime(readNumber(layer, "startTime", 0d), trimStart, safeSpeed);
-			double end = toExportTime(readNumber(layer, "endTime", exportedDuration), trimStart, safeSpeed);
-			end = Math.min(exportedDuration, end);
-			if (end <= start) {
+			double srcStart = readNumber(layer, "startTime", 0d);
+			double srcEnd = readNumber(layer, "endTime", rawDuration > 0 ? rawDuration : 86400d);
+			String enable = overlayEnableFromSourceWindow(plan, srcStart, srcEnd, exportedDuration);
+			if (enable == null) {
 				continue;
 			}
 			int width = Math.max(2, (int) Math.round(readNumber(layer, "width", 100d) * layerScaleX));
@@ -418,6 +594,10 @@ public class WorkspaceExportService {
 			double rotation = Math.toRadians(readNumber(layer, "rotation", 0d));
 
 			List<String> imageOps = new ArrayList<>();
+			if (imageInput.loopInput()) {
+				// Animated GIF/WebP-style alpha: normalize to rgba before scale/overlay.
+				imageOps.add("format=rgba");
+			}
 			imageOps.add("scale=" + width + ":" + height);
 			if (flipX) {
 				imageOps.add("hflip");
@@ -436,7 +616,7 @@ public class WorkspaceExportService {
 			parts.add("[" + (i + 1) + ":v]" + String.join(",", imageOps) + "[" + imgLabel + "]");
 			String next = "vi" + i;
 			parts.add("[" + current + "][" + imgLabel + "]overlay=x=" + x + ":y=" + y
-					+ ":enable='between(t," + formatDecimal(start) + "," + formatDecimal(end) + ")'"
+					+ ":enable='" + enable + "'"
 					+ "[" + next + "]");
 			current = next;
 		}
@@ -465,18 +645,33 @@ public class WorkspaceExportService {
 			int bgOpacity = readInt(payload, "subtitlesBackgroundOpacity", 65);
 			String backColour = assBackColourBlackFromOpacityPercent(bgOpacity);
 			int boxOutline = subtitleBoxOutlinePx(fontSize);
+			boolean captionBox = bgOpacity > 0;
+			String primaryAss = assOpaquePrimaryFromWebHex(readText(payload, "subtitlesPrimaryColor", "#FFFFFF"));
 			// Force Unicode decoding and prefer a Myanmar Unicode-capable font.
 			// Note: libass uses system fontconfig; if the font isn't installed, it will fall back.
 			String style = "FontName=" + escapeAss(fontName)
 					+ ",FontSize=" + fontSize
-					+ ",PrimaryColour=&H00FFFFFF"
-					// BorderStyle=3: box fill uses BackColour; Outline sets box padding (must be >0).
-					+ ",BorderStyle=3"
-					+ ",BackColour=" + backColour
-					+ ",Outline=" + boxOutline
-					+ ",Shadow=0"
-					+ ",Alignment=2"
-					+ ",MarginV=" + marginV;
+					+ ",PrimaryColour=" + primaryAss;
+			if (captionBox) {
+				style = style
+						// BorderStyle=3: box fill uses BackColour; Outline sets box padding (must be >0).
+						+ ",BorderStyle=3"
+						+ ",BackColour=" + backColour
+						+ ",Outline=" + boxOutline
+						+ ",Shadow=0"
+						+ ",Alignment=2"
+						+ ",MarginV=" + marginV;
+			} else {
+				// Plain fill only (no caption box); BorderStyle=3 + transparent BackColour still draws a padded box in libass.
+				style = style
+						+ ",BorderStyle=1"
+						+ ",BackColour=&HFF000000"
+						+ ",OutlineColour=&H00000000"
+						+ ",Outline=0"
+						+ ",Shadow=0"
+						+ ",Alignment=2"
+						+ ",MarginV=" + marginV;
+			}
 
 			String filter;
 			if (burnFile.toString().toLowerCase(Locale.ROOT).endsWith(".ass")) {
@@ -516,6 +711,8 @@ public class WorkspaceExportService {
 			int bgOpacity = readInt(payload, "subtitlesBackgroundOpacity", 65);
 			String backColour = assBackColourBlackFromOpacityPercent(bgOpacity);
 			int boxOutline = subtitleBoxOutlinePx(fontSize);
+			boolean captionBox = bgOpacity > 0;
+			String primaryAss = assOpaquePrimaryFromWebHex(readText(payload, "subtitlesPrimaryColor", "#FFFFFF"));
 
 			double posX = readNumber(payload.path("subtitlesPosition"), "x", -1d);
 			double posY = readNumber(payload.path("subtitlesPosition"), "y", -1d);
@@ -540,12 +737,18 @@ public class WorkspaceExportService {
 					if (parts.length >= 23) {
 						parts[1] = escapeAssField(fontName);
 						parts[2] = String.valueOf(fontSize);
-						parts[3] = "&H00FFFFFF";
+						parts[3] = primaryAss;
 						parts[4] = "&H00000000";
 						parts[5] = "&H00000000";
-						parts[6] = backColour;
-						parts[15] = "3";
-						parts[16] = String.valueOf(boxOutline);
+						if (captionBox) {
+							parts[6] = backColour;
+							parts[15] = "3";
+							parts[16] = String.valueOf(boxOutline);
+						} else {
+							parts[6] = "&HFF000000";
+							parts[15] = "1";
+							parts[16] = "0";
+						}
 						parts[17] = "0";
 						parts[18] = hasPos ? "5" : "2"; // an5 + \pos vs bottom-center
 						parts[21] = String.valueOf(marginV);
@@ -586,9 +789,7 @@ public class WorkspaceExportService {
 	private Path maybeWriteTextLayersAss(
 			JsonNode payload,
 			Path workDir,
-			double trimStart,
-			double safeSpeed,
-			double exportedDuration,
+			ExportSegmentPlan plan,
 			double scaleX,
 			double scaleY,
 			double offsetX,
@@ -622,12 +823,8 @@ public class WorkspaceExportService {
 				if (content == null || content.isBlank()) {
 					continue;
 				}
-				double start = toExportTime(readNumber(layer, "startTime", 0d), trimStart, safeSpeed);
-				double end = toExportTime(readNumber(layer, "endTime", exportedDuration), trimStart, safeSpeed);
-				end = Math.min(exportedDuration, end);
-				if (end <= start) {
-					continue;
-				}
+				double layerStart = readNumber(layer, "startTime", 0d);
+				double layerEnd = readNumber(layer, "endTime", readNumber(payload, "duration", 86400d));
 
 				// Preview: TextLayer centers glyphs in [x,y,width,height] (Rnd box). ASS must use the same anchor:
 				// middle-center + pos at box center, not top-left (\an7), or export position/size diverge from editor.
@@ -649,15 +846,28 @@ public class WorkspaceExportService {
 				String tags = "{\\an5\\pos(" + posX + "," + posY + ")\\fs" + fontSize + "\\1c" + color
 						+ "\\1a&H" + String.format(Locale.US, "%02X", alpha) + "&}";
 				String text = escapeAssDialogueText(content);
-				events.append("Dialogue: 0,")
-						.append(formatAssTime(start))
-						.append(",")
-						.append(formatAssTime(end))
-						.append(",Default,,0,0,0,,")
-						.append(tags)
-						.append(text)
-						.append('\n');
-				emitted++;
+				for (double[] s : plan.segments()) {
+					double cs = Math.max(layerStart, s[0]);
+					double ce = Math.min(layerEnd, s[1]);
+					if (ce <= cs + 1e-6d) {
+						continue;
+					}
+					double start = sourceTimeToExport(plan, cs);
+					double end = sourceTimeToExport(plan, ce);
+					end = Math.min(plan.exportedDuration(), end);
+					if (end <= start + 1e-4d) {
+						continue;
+					}
+					events.append("Dialogue: 0,")
+							.append(formatAssTime(start))
+							.append(",")
+							.append(formatAssTime(end))
+							.append(",Default,,0,0,0,,")
+							.append(tags)
+							.append(text)
+							.append('\n');
+					emitted++;
+				}
 			}
 			if (emitted == 0) {
 				log.warn("[workspace-export] textLayers array non-empty but no dialogue lines emitted (check timing vs trim, or blank content)");
@@ -831,10 +1041,17 @@ public class WorkspaceExportService {
 			}
 			try {
 				Path downloaded = objectStorageTransferService.download(src, workDir);
-				Path normalized = workDir.resolve("layer-image-" + out.size() + ".png");
-				ffmpegRunner.run(
-						List.of("-y", "-i", downloaded.toString(), "-frames:v", "1", normalized.toString()));
-				out.add(new ImageInput(layer, normalized));
+				boolean animatedGif = isLikelyAnimatedGif(src, downloaded);
+				if (animatedGif) {
+					Path normalized = workDir.resolve("layer-image-" + out.size() + ".gif");
+					Files.copy(downloaded, normalized, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+					out.add(new ImageInput(layer, normalized, true));
+				} else {
+					Path normalized = workDir.resolve("layer-image-" + out.size() + ".png");
+					ffmpegRunner.run(
+							List.of("-y", "-i", downloaded.toString(), "-frames:v", "1", normalized.toString()));
+					out.add(new ImageInput(layer, normalized, false));
+				}
 			} catch (Exception e) {
 				// Many external hosts (e.g. Pinterest) block non-browser fetches. Skip overlay instead of failing export.
 				log.warn("Skipping image overlay; could not download or decode: {}", src, e);
@@ -843,9 +1060,15 @@ public class WorkspaceExportService {
 		return out;
 	}
 
-	private double toExportTime(double sourceTime, double trimStart, double speed) {
-		double shifted = Math.max(0d, sourceTime - trimStart);
-		return shifted / Math.max(0.0001d, speed);
+	/**
+	 * If we flatten these to a single PNG, export loses animation; keep as GIF and loop in filtergraph.
+	 */
+	private static boolean isLikelyAnimatedGif(String srcUrl, Path downloadedFile) {
+		if (srcUrl != null && srcUrl.toLowerCase(Locale.ROOT).contains(".gif")) {
+			return true;
+		}
+		String name = downloadedFile.getFileName().toString().toLowerCase(Locale.ROOT);
+		return name.endsWith(".gif");
 	}
 
 	private String readRequiredText(JsonNode payload, String field) {
@@ -960,7 +1183,11 @@ public class WorkspaceExportService {
 		return String.join(",", chain);
 	}
 
-	private static String toAssPrimaryColor(String raw) {
+	/**
+	 * ASS {@code PrimaryColour} for opaque glyphs from CSS-style {@code #RRGGBB}. Format {@code &HAABBGGRR}
+	 * with {@code AA=00} opaque (libass / VSFilter).
+	 */
+	private static String assOpaquePrimaryFromWebHex(String raw) {
 		String hex = raw == null ? "FFFFFF" : raw.trim();
 		if (hex.startsWith("#")) {
 			hex = hex.substring(1);
@@ -971,7 +1198,11 @@ public class WorkspaceExportService {
 		String rr = hex.substring(0, 2);
 		String gg = hex.substring(2, 4);
 		String bb = hex.substring(4, 6);
-		return "&H" + bb + gg + rr + "&";
+		return "&H00" + bb + gg + rr;
+	}
+
+	private static String toAssPrimaryColor(String raw) {
+		return assOpaquePrimaryFromWebHex(raw) + "&";
 	}
 
 	private static int toAssAlpha(double opacity) {
@@ -1029,7 +1260,9 @@ public class WorkspaceExportService {
 
 	private record ImageInput(
 			JsonNode layer,
-			Path path
+			Path path,
+			/** When true, pass {@code -stream_loop -1} before this input so GIF loops for the overlay window. */
+			boolean loopInput
 	) {
 	}
 }
