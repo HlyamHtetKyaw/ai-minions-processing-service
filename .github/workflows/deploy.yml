@@ -2,7 +2,7 @@ name: Deploy processing-service
 
 on:
   push:
-    branches: [main]
+    branches: [staging]
 
 concurrency:
   group: deploy-processing-service
