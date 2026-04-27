@@ -1,0 +1,44 @@
+name: Deploy processing-service
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-processing-service
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build
+        run: mvn -B -DskipTests package
+
+      - name: SSH setup
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Upload JAR
+        run: |
+          scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=yes \
+            target/processingservice-0.0.1-SNAPSHOT.jar \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/home/flypay66/jars/processing-service.jar"
+
+      - name: Restart service
+        run: |
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=yes \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            'sudo systemctl restart pricessing'
