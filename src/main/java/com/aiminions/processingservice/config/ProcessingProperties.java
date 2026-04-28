@@ -10,10 +10,31 @@ import lombok.Setter;
 @ConfigurationProperties(prefix = "app.processing")
 public class ProcessingProperties {
 
-	private String redisJobChannel = "ai-minions:jobs:transcribe";
+	private boolean consumeJobs = true;
 
+	private String redisJobChannel = "ai-minions:jobs:transcribe";
 	private String redisBalancedSyncJobChannel = "ai-minions:jobs:balanced-sync";
 	private String redisSubtitlesJobChannel = "ai-minions:jobs:subtitles";
+	private String redisWorkspaceExportJobChannel = "ai-minions:jobs:workspace-export";
+
+	private String redisTranscribeJobStream = "ai-minions:stream:jobs:transcribe";
+	private String redisSubtitlesJobStream = "ai-minions:stream:jobs:subtitles";
+	private String redisBalancedSyncJobStream = "ai-minions:stream:jobs:balanced-sync";
+	private String redisWorkspaceExportJobStream = "ai-minions:stream:jobs:workspace-export";
+
+	private String redisTranscribeJobStreamGroup = "processing-transcribe";
+	private String redisSubtitlesJobStreamGroup = "processing-subtitles";
+	private String redisBalancedSyncJobStreamGroup = "processing-balanced-sync";
+	private String redisWorkspaceExportJobStreamGroup = "processing-workspace-export";
+
+	private String redisTranscribeJobDlqStream = "ai-minions:stream:jobs:transcribe:dlq";
+	private String redisSubtitlesJobDlqStream = "ai-minions:stream:jobs:subtitles:dlq";
+	private String redisBalancedSyncJobDlqStream = "ai-minions:stream:jobs:balanced-sync:dlq";
+	private String redisWorkspaceExportJobDlqStream = "ai-minions:stream:jobs:workspace-export:dlq";
+
+	private int redisStreamReadBlockMs = 2000;
+	private int redisStreamClaimIdleMs = 60000;
+	private int redisStreamMaxAttempts = 3;
 
 	private String generationStatusChannelPrefix = "ai-minions:generation:status:";
 
