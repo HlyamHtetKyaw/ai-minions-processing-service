@@ -20,6 +20,10 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 import java.util.Map;
 import java.util.regex.Matcher;
@@ -142,13 +146,23 @@ public class WorkspaceExportService {
 	) throws IOException, InterruptedException {
 		int[] size = probeVideoSize(input);
 		ExportSegmentPlan plan = buildExportSegmentPlan(payload, trimStart, trimEnd, speed);
-		boolean muted = readBoolean(payload.path("originalAudio"), "muted", false);
+		boolean originalMuted = readBoolean(payload.path("originalAudio"), "muted", false);
 		double originalVol = readNumber(payload.path("originalAudio"), "volume", 100d) / 100d;
 		boolean hasAudio = probeHasAudio(input);
-		boolean audioFromGraph = plan.multi() && !muted && hasAudio;
+		boolean includeOriginalAudio = !originalMuted && hasAudio;
 
 		List<String> args = new ArrayList<>();
 		args.add("-y");
+		int ffmpegThreads = Math.max(0, processingProperties.getWorkspaceExportFfmpegThreads());
+		log.info("FFmpeg threads: {}", ffmpegThreads);
+		if (ffmpegThreads > 0) {
+			args.add("-threads");
+			args.add(String.valueOf(ffmpegThreads));
+			args.add("-filter_threads");
+			args.add(String.valueOf(ffmpegThreads));
+			args.add("-filter_complex_threads");
+			args.add(String.valueOf(ffmpegThreads));
+		}
 		if (!plan.multi()) {
 			double t0 = plan.segments().get(0)[0];
 			if (t0 > 0) {
@@ -176,44 +190,40 @@ public class WorkspaceExportService {
 			args.add("-i");
 			args.add(image.path().toString());
 		}
+		List<AudioInput> externalAudioInputs = collectAudioInputs(payload, workDir);
+		int audioInputStartIndex = 1 + images.size();
+		for (AudioInput audioInput : externalAudioInputs) {
+			args.add("-i");
+			args.add(audioInput.path().toString());
+		}
+		boolean needAudioGraph = includeOriginalAudio || !externalAudioInputs.isEmpty();
 
 		String filterComplex = buildFilterComplex(
-				payload, plan, images, srtFile, workDir, size[0], size[1], audioFromGraph, originalVol);
+				payload, plan, images, externalAudioInputs, audioInputStartIndex,
+				srtFile, workDir, size[0], size[1], includeOriginalAudio, needAudioGraph, originalVol);
 		args.add("-filter_complex");
 		args.add(filterComplex);
 		args.add("-map");
 		args.add("[vout]");
 
-		if (muted) {
-			args.add("-an");
-		} else if (audioFromGraph) {
+		if (needAudioGraph) {
 			args.add("-map");
 			args.add("[aout]");
-		} else if (plan.multi()) {
-			// Disjoint kept spans: without a decodable audio stream we cannot align 0:a to the concat video.
-			args.add("-an");
 		} else {
-			args.add("-map");
-			args.add("0:a?");
-			List<String> audioFilters = new ArrayList<>();
-			if (Math.abs(speed - 1d) > 0.0001d) {
-				audioFilters.add(buildAtempoFilter(speed));
-			}
-			if (Math.abs(originalVol - 1d) > 0.0001d) {
-				audioFilters.add("volume=" + formatDecimal(Math.max(0d, originalVol)));
-			}
-			if (!audioFilters.isEmpty()) {
-				args.add("-af");
-				args.add(String.join(",", audioFilters));
-			}
+			args.add("-an");
 		}
 
 		args.add("-c:v");
 		args.add("libx264");
 		args.add("-preset");
-		args.add("veryfast");
+		String preset = processingProperties.getWorkspaceExportPreset();
+		if (preset == null || preset.isBlank()) {
+			preset = "veryfast";
+		}
+		args.add(preset.trim());
 		args.add("-crf");
-		args.add("23");
+		int crf = Math.max(10, Math.min(35, processingProperties.getWorkspaceExportCrf()));
+		args.add(String.valueOf(crf));
 		args.add("-c:a");
 		args.add("aac");
 		args.add("-movflags");
@@ -450,11 +460,14 @@ public class WorkspaceExportService {
 			JsonNode payload,
 			ExportSegmentPlan plan,
 			List<ImageInput> images,
+			List<AudioInput> externalAudioInputs,
+			int audioInputStartIndex,
 			Path srtFile,
 			Path workDir,
 			int videoW,
 			int videoH,
-			boolean buildConcatAudioInGraph,
+			boolean includeOriginalAudio,
+			boolean needAudioGraph,
 			double originalVolume
 	) {
 		List<String> parts = new ArrayList<>();
@@ -486,9 +499,18 @@ public class WorkspaceExportService {
 			}
 			parts.add(String.join("", vLabels) + "concat=n=" + n + ":v=1:a=0[vcat]");
 			current = "vcat";
-			if (buildConcatAudioInGraph) {
+		} else {
+			current = "v0";
+			parts.add("[0:v]setpts=" + formatDecimal(1d / safeSpeed) + "*PTS[" + current + "]");
+		}
+
+		List<String> mixAudioLabels = new ArrayList<>();
+		if (includeOriginalAudio) {
+			String originalLabel;
+			if (plan.multi()) {
 				List<String> aLabels = new ArrayList<>();
-				for (int i = 0; i < n; i++) {
+				List<double[]> segs = plan.segments();
+				for (int i = 0; i < segs.size(); i++) {
 					double a = segs.get(i)[0];
 					double b = segs.get(i)[1];
 					String aLab = "ax" + i;
@@ -497,12 +519,43 @@ public class WorkspaceExportService {
 							+ ",asetpts=PTS-STARTPTS," + tempoChain + "[" + aLab + "]");
 					aLabels.add("[" + aLab + "]");
 				}
-				parts.add(String.join("", aLabels) + "concat=n=" + n + ":v=0:a=1[acat]");
-				parts.add("[acat]volume=" + formatDecimal(Math.max(0d, originalVolume)) + "[aout]");
+				parts.add(String.join("", aLabels) + "concat=n=" + segs.size() + ":v=0:a=1[aorigc]");
+				originalLabel = "aorigc";
+			} else {
+				List<String> audioOps = new ArrayList<>();
+				audioOps.add("asetpts=PTS-STARTPTS");
+				if (Math.abs(safeSpeed - 1d) > 0.0001d) {
+					audioOps.add(buildAtempoFilter(safeSpeed));
+				}
+				parts.add("[0:a]" + String.join(",", audioOps) + "[aorigc]");
+				originalLabel = "aorigc";
 			}
-		} else {
-			current = "v0";
-			parts.add("[0:v]setpts=" + formatDecimal(1d / safeSpeed) + "*PTS[" + current + "]");
+			if (Math.abs(originalVolume - 1d) > 0.0001d) {
+				parts.add("[" + originalLabel + "]volume=" + formatDecimal(Math.max(0d, originalVolume)) + "[aorig]");
+				originalLabel = "aorig";
+			}
+			mixAudioLabels.add(originalLabel);
+		}
+		for (int i = 0; i < externalAudioInputs.size(); i++) {
+			AudioInput externalAudio = externalAudioInputs.get(i);
+			String label = buildExternalAudioTrackFilter(
+					parts, externalAudio.layer(), audioInputStartIndex + i, i, plan);
+			if (label != null && !label.isBlank()) {
+				mixAudioLabels.add(label);
+			}
+		}
+		if (needAudioGraph) {
+			if (mixAudioLabels.isEmpty()) {
+				parts.add("anullsrc=r=48000:cl=stereo,atrim=0:" + formatDecimal(plan.exportedDuration()) + "[aout]");
+			} else if (mixAudioLabels.size() == 1) {
+				parts.add("[" + mixAudioLabels.get(0) + "]anull[aout]");
+			} else {
+				StringBuilder inputs = new StringBuilder();
+				for (String label : mixAudioLabels) {
+					inputs.append("[").append(label).append("]");
+				}
+				parts.add(inputs + "amix=inputs=" + mixAudioLabels.size() + ":normalize=0[aout]");
+			}
 		}
 
 		boolean protectFlip = readBoolean(payload, "protectFlip", false);
@@ -542,36 +595,12 @@ public class WorkspaceExportService {
 			outputVideoH = cropH;
 			layerScaleX = baseScaleX * ((double) cropW / (double) videoW);
 			layerScaleY = baseScaleY * ((double) cropH / (double) videoH);
-			layerOffsetX = -cropX;
-			layerOffsetY = -cropY;
+			// Crop is applied to the base stream BEFORE overlays, so overlay coordinates should be
+			// in post-crop space (origin at cropped frame top-left). Do not subtract crop offsets here.
+			layerOffsetX = 0d;
+			layerOffsetY = 0d;
 			String next = "vaspect";
 			parts.add("[" + current + "]crop=" + cropW + ":" + cropH + ":" + cropX + ":" + cropY + "[" + next + "]");
-			current = next;
-		}
-
-		// Viral-style text burn-in: write text layers to ASS and burn with complex shaping.
-		Path textLayersAss = maybeWriteTextLayersAss(
-				payload, workDir, plan,
-				layerScaleX, layerScaleY, layerOffsetX, layerOffsetY,
-				outputVideoW, outputVideoH
-		);
-		if (textLayersAss != null) {
-			String next = "vtass";
-			String escapedTextAss = escapePathForFfmpegFilter(textLayersAss.toString());
-			String textAssFilter = "ass='" + escapedTextAss + "':shaping=complex:original_size=" + outputVideoW + "x" + outputVideoH;
-			String textFontsDir = "";
-			if (workDir != null) {
-				textFontsDir = extractBundledFontDir(workDir);
-			}
-			if (textFontsDir.isBlank()) {
-				textFontsDir = processingProperties.getSubtitlesFontsDir() == null ? "" : processingProperties.getSubtitlesFontsDir().trim();
-			}
-			if (!textFontsDir.isBlank()) {
-				textAssFilter = textAssFilter + ":fontsdir='" + escapePathForFfmpegFilter(textFontsDir) + "'";
-			} else {
-				log.warn("[workspace-export] text-layer ASS burn-in has no fontsdir (bundled font not extracted); libass may omit glyphs if the face is not on the system font path");
-			}
-			parts.add("[" + current + "]" + textAssFilter + "[" + next + "]");
 			current = next;
 		}
 
@@ -618,6 +647,83 @@ public class WorkspaceExportService {
 			parts.add("[" + current + "][" + imgLabel + "]overlay=x=" + x + ":y=" + y
 					+ ":enable='" + enable + "'"
 					+ "[" + next + "]");
+			current = next;
+		}
+
+		JsonNode blurLayers = payload.path("blurLayers");
+		if (blurLayers.isArray()) {
+			double previewCanvasW = readNumber(payload.path("canvasFrame"), "width", 0d);
+			double previewCanvasH = readNumber(payload.path("canvasFrame"), "height", 0d);
+			double blurScaleX =
+					previewCanvasW > 1d
+							? ((double) outputVideoW / previewCanvasW)
+							: layerScaleX;
+			double blurScaleY =
+					previewCanvasH > 1d
+							? ((double) outputVideoH / previewCanvasH)
+							: layerScaleY;
+			int blurIndex = 0;
+			for (JsonNode layer : blurLayers) {
+				double srcStart = readNumber(layer, "startTime", 0d);
+				double srcEnd = readNumber(layer, "endTime", rawDuration > 0 ? rawDuration : 86400d);
+				String enable = overlayEnableFromSourceWindow(plan, srcStart, srcEnd, exportedDuration);
+				if (enable == null) {
+					continue;
+				}
+				int requestedW = Math.max(2, (int) Math.round(readNumber(layer, "width", 100d) * blurScaleX));
+				int requestedH = Math.max(2, (int) Math.round(readNumber(layer, "height", 100d) * blurScaleY));
+				int requestedX = (int) Math.round(readNumber(layer, "x", 0d) * blurScaleX);
+				int requestedY = (int) Math.round(readNumber(layer, "y", 0d) * blurScaleY);
+				int x = Math.max(0, Math.min(Math.max(0, outputVideoW - 2), requestedX));
+				int y = Math.max(0, Math.min(Math.max(0, outputVideoH - 2), requestedY));
+				int w = Math.max(2, Math.min(requestedW, outputVideoW - x));
+				int h = Math.max(2, Math.min(requestedH, outputVideoH - y));
+				if (w < 2 || h < 2) {
+					continue;
+				}
+				int intensity = Math.max(1, Math.min(80, readInt(layer, "intensity", 20)));
+				int radius = Math.max(1, Math.min(64, (int) Math.round(intensity / 2d)));
+
+				String baseLabel = "vb" + blurIndex + "b";
+				String blurSourceLabel = "vb" + blurIndex + "s";
+				String blurLabel = "vb" + blurIndex + "f";
+				String cropLabel = "vb" + blurIndex + "c";
+				String next = "vb" + blurIndex;
+				parts.add("[" + current + "]split=2[" + baseLabel + "][" + blurSourceLabel + "]");
+				parts.add("[" + blurSourceLabel + "]boxblur=luma_radius=" + radius
+						+ ":luma_power=1:chroma_radius=" + radius + ":chroma_power=1[" + blurLabel + "]");
+				parts.add("[" + blurLabel + "]crop=" + w + ":" + h + ":" + x + ":" + y + "[" + cropLabel + "]");
+				parts.add("[" + baseLabel + "][" + cropLabel + "]overlay=x=" + x + ":y=" + y
+						+ ":enable='" + enable + "'[" + next + "]");
+				current = next;
+				blurIndex++;
+			}
+		}
+
+		// Viral-style text burn-in: write text layers to ASS and burn with complex shaping.
+		// Keep text above image + blur overlays so export matches preview layering.
+		Path textLayersAss = maybeWriteTextLayersAss(
+				payload, workDir, plan,
+				layerScaleX, layerScaleY, layerOffsetX, layerOffsetY,
+				outputVideoW, outputVideoH
+		);
+		if (textLayersAss != null) {
+			String next = "vtass";
+			String escapedTextAss = escapePathForFfmpegFilter(textLayersAss.toString());
+			String textAssFilter = "ass='" + escapedTextAss + "':shaping=complex:original_size=" + outputVideoW + "x" + outputVideoH;
+			String textFontsDir = "";
+			if (workDir != null) {
+				textFontsDir = extractBundledFontDir(workDir);
+			}
+			if (textFontsDir.isBlank()) {
+				textFontsDir = processingProperties.getSubtitlesFontsDir() == null ? "" : processingProperties.getSubtitlesFontsDir().trim();
+			}
+			if (!textFontsDir.isBlank()) {
+				textAssFilter = textAssFilter + ":fontsdir='" + escapePathForFfmpegFilter(textFontsDir) + "'";
+			} else {
+				log.warn("[workspace-export] text-layer ASS burn-in has no fontsdir (bundled font not extracted); libass may omit glyphs if the face is not on the system font path");
+			}
+			parts.add("[" + current + "]" + textAssFilter + "[" + next + "]");
 			current = next;
 		}
 
@@ -1034,30 +1140,185 @@ public class WorkspaceExportService {
 		if (!imageLayers.isArray()) {
 			return out;
 		}
+		List<JsonNode> layers = new ArrayList<>();
 		for (JsonNode layer : imageLayers) {
-			String src = ObjectStorageTransferService.stripUrlFragmentForDownload(readText(layer, "src", ""));
+			layers.add(layer);
+		}
+		if (layers.isEmpty()) return out;
+
+		int workers = Math.max(1, processingProperties.getWorkspaceExportImagePrepThreads());
+		workers = Math.min(workers, Math.max(1, layers.size()));
+		ExecutorService pool = Executors.newFixedThreadPool(workers);
+		try {
+			List<CompletableFuture<ImageInput>> futures = new ArrayList<>();
+			for (int i = 0; i < layers.size(); i++) {
+				final int idx = i;
+				final JsonNode layer = layers.get(i);
+				futures.add(CompletableFuture.supplyAsync(() -> prepareImageInput(layer, idx, workDir), pool));
+			}
+			for (CompletableFuture<ImageInput> f : futures) {
+				try {
+					ImageInput input = f.get();
+					if (input != null) {
+						out.add(input);
+					}
+				} catch (Exception e) {
+					// Keep export resilient: image overlay failures should not fail the entire export.
+					log.warn("Skipping one image overlay after async preparation failure", e);
+				}
+			}
+		} finally {
+			pool.shutdown();
+			if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
+				pool.shutdownNow();
+			}
+		}
+		return out;
+	}
+
+	private List<AudioInput> collectAudioInputs(JsonNode payload, Path workDir) {
+		List<AudioInput> out = new ArrayList<>();
+		JsonNode audioTracks = payload.path("audioTracks");
+		if (!audioTracks.isArray()) {
+			return out;
+		}
+		int index = 0;
+		for (JsonNode track : audioTracks) {
+			String src = readText(track, "src", "");
 			if (src == null || src.isBlank()) {
+				index++;
 				continue;
 			}
 			try {
 				Path downloaded = objectStorageTransferService.download(src, workDir);
-				boolean animatedGif = isLikelyAnimatedGif(src, downloaded);
-				if (animatedGif) {
-					Path normalized = workDir.resolve("layer-image-" + out.size() + ".gif");
-					Files.copy(downloaded, normalized, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-					out.add(new ImageInput(layer, normalized, true));
-				} else {
-					Path normalized = workDir.resolve("layer-image-" + out.size() + ".png");
-					ffmpegRunner.run(
-							List.of("-y", "-i", downloaded.toString(), "-frames:v", "1", normalized.toString()));
-					out.add(new ImageInput(layer, normalized, false));
-				}
-			} catch (Exception e) {
-				// Many external hosts (e.g. Pinterest) block non-browser fetches. Skip overlay instead of failing export.
-				log.warn("Skipping image overlay; could not download or decode: {}", src, e);
+				Path normalized = workDir.resolve("layer-audio-" + index + ".m4a");
+				ffmpegRunner.run(List.of(
+						"-y", "-i", downloaded.toString(),
+						"-vn", "-ac", "2", "-ar", "48000",
+						"-c:a", "aac",
+						normalized.toString()
+				));
+				out.add(new AudioInput(track, normalized));
+			} catch (Exception ex) {
+				log.warn("Skipping external audio track; could not download or decode: {}", src, ex);
 			}
+			index++;
 		}
 		return out;
+	}
+
+	private String buildExternalAudioTrackFilter(
+			List<String> parts,
+			JsonNode track,
+			int inputIndex,
+			int trackIndex,
+			ExportSegmentPlan plan
+	) {
+		double sourceStart = readNumber(track, "startTime", 0d);
+		double sourceEnd = readNumber(track, "endTime", sourceStart);
+		if (sourceEnd <= sourceStart + 1e-6d) {
+			return null;
+		}
+		List<double[]> overlaps = new ArrayList<>();
+		for (double[] s : plan.segments()) {
+			double cs = Math.max(sourceStart, s[0]);
+			double ce = Math.min(sourceEnd, s[1]);
+			if (ce > cs + 1e-6d) {
+				overlaps.add(new double[]{cs, ce});
+			}
+		}
+		if (overlaps.isEmpty()) {
+			return null;
+		}
+
+		String sourceLabel = "am" + trackIndex + "src";
+		parts.add("[" + inputIndex + ":a]asetpts=PTS-STARTPTS[" + sourceLabel + "]");
+		List<String> chunkLabels = new ArrayList<>();
+		double exportedTrackDuration = 0d;
+		for (int i = 0; i < overlaps.size(); i++) {
+			double cs = overlaps.get(i)[0];
+			double ce = overlaps.get(i)[1];
+			double offsetInTrack = Math.max(0d, cs - sourceStart);
+			double overlapLen = Math.max(0d, ce - cs);
+			if (overlapLen <= 1e-6d) {
+				continue;
+			}
+			exportedTrackDuration += overlapLen / plan.safeSpeed();
+			String chunk = "am" + trackIndex + "c" + i;
+			String trimmed = "atrim=start=" + formatDecimal(offsetInTrack)
+					+ ":end=" + formatDecimal(offsetInTrack + overlapLen)
+					+ ",asetpts=PTS-STARTPTS";
+			String speedOp = Math.abs(plan.safeSpeed() - 1d) > 0.0001d
+					? "," + buildAtempoFilter(plan.safeSpeed())
+					: "";
+			parts.add("[" + sourceLabel + "]" + trimmed + speedOp + "[" + chunk + "]");
+			chunkLabels.add("[" + chunk + "]");
+		}
+		if (chunkLabels.isEmpty()) {
+			return null;
+		}
+
+		String mergedLabel;
+		if (chunkLabels.size() == 1) {
+			mergedLabel = "am" + trackIndex + "m";
+			parts.add(chunkLabels.get(0) + "anull[" + mergedLabel + "]");
+		} else {
+			mergedLabel = "am" + trackIndex + "m";
+			parts.add(String.join("", chunkLabels) + "concat=n=" + chunkLabels.size() + ":v=0:a=1[" + mergedLabel + "]");
+		}
+
+		String shapedLabel = "am" + trackIndex + "s";
+		List<String> ops = new ArrayList<>();
+		double vol = Math.max(0d, Math.min(1d, readNumber(track, "volume", 100d) / 100d));
+		if (Math.abs(vol - 1d) > 0.0001d) {
+			ops.add("volume=" + formatDecimal(vol));
+		}
+		double fadeIn = Math.max(0d, readNumber(track, "fadeIn", 0d) / plan.safeSpeed());
+		double fadeOut = Math.max(0d, readNumber(track, "fadeOut", 0d) / plan.safeSpeed());
+		if (fadeIn > 1e-6d) {
+			ops.add("afade=t=in:st=0:d=" + formatDecimal(Math.min(fadeIn, exportedTrackDuration)));
+		}
+		if (fadeOut > 1e-6d && exportedTrackDuration > fadeOut + 1e-6d) {
+			ops.add("afade=t=out:st=" + formatDecimal(Math.max(0d, exportedTrackDuration - fadeOut))
+					+ ":d=" + formatDecimal(fadeOut));
+		}
+		if (ops.isEmpty()) {
+			parts.add("[" + mergedLabel + "]anull[" + shapedLabel + "]");
+		} else {
+			parts.add("[" + mergedLabel + "]" + String.join(",", ops) + "[" + shapedLabel + "]");
+		}
+
+		double delayStart = sourceTimeToExport(plan, overlaps.get(0)[0]);
+		if (delayStart <= 1e-6d) {
+			return shapedLabel;
+		}
+		long delayMs = Math.max(0L, Math.round(delayStart * 1000d));
+		String delayedLabel = "am" + trackIndex + "d";
+		parts.add("[" + shapedLabel + "]adelay=" + delayMs + "|" + delayMs + "[" + delayedLabel + "]");
+		return delayedLabel;
+	}
+
+	private ImageInput prepareImageInput(JsonNode layer, int index, Path workDir) {
+		String src = ObjectStorageTransferService.stripUrlFragmentForDownload(readText(layer, "src", ""));
+		if (src == null || src.isBlank()) {
+			return null;
+		}
+		try {
+			Path downloaded = objectStorageTransferService.download(src, workDir);
+			boolean animatedGif = isLikelyAnimatedGif(src, downloaded);
+			if (animatedGif) {
+				Path normalized = workDir.resolve("layer-image-" + index + ".gif");
+				Files.copy(downloaded, normalized, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+				return new ImageInput(layer, normalized, true);
+			}
+			Path normalized = workDir.resolve("layer-image-" + index + ".png");
+			ffmpegRunner.run(List.of("-y", "-i", downloaded.toString(), "-frames:v", "1", normalized.toString()));
+			return new ImageInput(layer, normalized, false);
+		} catch (Exception e) {
+			// Many external hosts (e.g. Pinterest) block non-browser fetches. Skip overlay instead of failing export.
+			log.warn("Skipping image overlay; could not download or decode: {}", src, e);
+			return null;
+		}
 	}
 
 	/**
@@ -1263,6 +1524,12 @@ public class WorkspaceExportService {
 			Path path,
 			/** When true, pass {@code -stream_loop -1} before this input so GIF loops for the overlay window. */
 			boolean loopInput
+	) {
+	}
+
+	private record AudioInput(
+			JsonNode layer,
+			Path path
 	) {
 	}
 }

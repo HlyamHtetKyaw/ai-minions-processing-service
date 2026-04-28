@@ -3,12 +3,14 @@ package com.aiminions.processingservice.storage;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
+import java.net.URLDecoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 
@@ -175,6 +177,14 @@ public class ObjectStorageTransferService {
 	}
 
 	public Path download(String storageUrl, Path workDir) throws IOException, InterruptedException {
+		WorkspaceObjectRef workspaceObjectRef = parseWorkspaceObjectRef(storageUrl);
+		if (workspaceObjectRef != null) {
+			try {
+				return downloadWorkspaceObjectRef(workspaceObjectRef, workDir);
+			} catch (Exception ex) {
+				log.warn("Workspace-key direct download failed, falling back to URL: {}", workspaceObjectRef.key(), ex);
+			}
+		}
 		String forDownload = stripUrlFragmentForDownload(storageUrl);
 		URI u = URI.create(forDownload.trim());
 		String scheme = u.getScheme();
@@ -193,6 +203,98 @@ public class ObjectStorageTransferService {
 			}
 			default -> throw new IllegalArgumentException("Unsupported storage URL scheme: " + scheme);
 		};
+	}
+
+	private Path downloadWorkspaceObjectRef(WorkspaceObjectRef ref, Path workDir) throws IOException {
+		String bucket = ref.bucket() == null || ref.bucket().isBlank() ? props.getBucket() : ref.bucket();
+		if (bucket == null || bucket.isBlank()) {
+			throw new IOException("Storage bucket is not configured for workspace object download");
+		}
+		String key = ref.key();
+		String name = Path.of(key).getFileName().toString();
+		if (name.isBlank()) {
+			name = "download.bin";
+		}
+		Path out = workDir.resolve(sanitizeLocalName(name));
+
+		// Use provider hint from URL when available so mixed configs still resolve workspace media.
+		if (ref.providerHint() == StorageProviderHint.GCP) {
+			ensureGcsClient();
+			byte[] data = gcs.readAllBytes(BlobId.of(bucket, key));
+			Files.write(out, data);
+			return out;
+		}
+		if (ref.providerHint() == StorageProviderHint.S3) {
+			ensureS3Client();
+			GetObjectRequest get = GetObjectRequest.builder().bucket(bucket).key(key).build();
+			s3Client.getObject(get, out);
+			return out;
+		}
+		if (props.getProvider() == WorkerStorageProperties.Provider.GCP) {
+			ensureGcsClient();
+			byte[] data = gcs.readAllBytes(BlobId.of(bucket, key));
+			Files.write(out, data);
+			return out;
+		}
+		ensureS3Client();
+		GetObjectRequest get = GetObjectRequest.builder().bucket(bucket).key(key).build();
+		s3Client.getObject(get, out);
+		return out;
+	}
+
+	private WorkspaceObjectRef parseWorkspaceObjectRef(String storageUrl) {
+		if (storageUrl == null || storageUrl.isBlank()) {
+			return null;
+		}
+		String trimmed = storageUrl.trim();
+		int hashIdx = trimmed.indexOf('#');
+		if (hashIdx < 0 || hashIdx >= trimmed.length() - 1) {
+			return null;
+		}
+		String fragment = trimmed.substring(hashIdx + 1);
+		String workspaceKey = null;
+		for (String token : fragment.split("&")) {
+			int eq = token.indexOf('=');
+			String k = eq >= 0 ? token.substring(0, eq) : token;
+			String v = eq >= 0 ? token.substring(eq + 1) : "";
+			if ("wk".equals(k) && !v.isBlank()) {
+				workspaceKey = URLDecoder.decode(v, StandardCharsets.UTF_8);
+				break;
+			}
+		}
+		if (workspaceKey == null || workspaceKey.isBlank()) {
+			return null;
+		}
+		String bucket = null;
+		StorageProviderHint providerHint = StorageProviderHint.UNKNOWN;
+		try {
+			String noFragment = stripUrlFragmentForDownload(trimmed);
+			URI u = URI.create(noFragment);
+			String host = u.getHost();
+			String path = u.getPath() == null ? "" : u.getPath();
+			// https://storage.googleapis.com/{bucket}/{key}
+			if (host != null && host.equalsIgnoreCase("storage.googleapis.com")) {
+				providerHint = StorageProviderHint.GCP;
+				String clean = stripLeadingSlash(path);
+				int slash = clean.indexOf('/');
+				if (slash > 0) {
+					bucket = clean.substring(0, slash);
+				}
+			// https://{bucket}.storage.googleapis.com/{key}
+			} else if (host != null && host.endsWith(".storage.googleapis.com")) {
+				providerHint = StorageProviderHint.GCP;
+				bucket = host.substring(0, host.length() - ".storage.googleapis.com".length());
+			// s3://{bucket}/{key}, gs://{bucket}/{key}
+			} else if (host != null && ("s3".equalsIgnoreCase(u.getScheme()) || "gs".equalsIgnoreCase(u.getScheme()))) {
+				providerHint = "gs".equalsIgnoreCase(u.getScheme()) ? StorageProviderHint.GCP : StorageProviderHint.S3;
+				bucket = host;
+			} else if (host != null && host.contains("amazonaws.com")) {
+				providerHint = StorageProviderHint.S3;
+			}
+		} catch (Exception ignored) {
+			// Best-effort; fallback bucket from properties.
+		}
+		return new WorkspaceObjectRef(bucket, workspaceKey, providerHint);
 	}
 
 	private static final String HTTP_DOWNLOAD_USER_AGENT =
@@ -279,6 +381,10 @@ public class ObjectStorageTransferService {
 		String n = name.replace("\\", "_").replace("/", "_");
 		return n.isBlank() ? "download.bin" : n;
 	}
+
+	private enum StorageProviderHint { UNKNOWN, GCP, S3 }
+
+	private record WorkspaceObjectRef(String bucket, String key, StorageProviderHint providerHint) {}
 
 	public StoredObject uploadPng(byte[] bytes, String keyHint) {
 		if (bytes == null || bytes.length == 0) {

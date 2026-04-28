@@ -117,10 +117,12 @@ public class TranscribePipeline {
 		} catch (JsonProcessingException e) {
 			log.error("Transcribe job {} failed (JSON)", jobId, e);
 			failJob(jobId, "AI response parse error: " + e.getMessage());
+			throw new IllegalStateException(e);
 		} catch (Exception e) {
 			log.error("Transcribe job {} failed", jobId, e);
 			String err = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
 			failJob(jobId, err);
+			throw new IllegalStateException(e);
 		} finally {
 			if (workDir != null) {
 				try {

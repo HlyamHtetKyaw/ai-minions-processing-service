@@ -104,6 +104,7 @@ public class BalancedSyncPipeline {
 		} catch (Exception e) {
 			log.error("Balanced sync job {} failed", jobId, e);
 			failJob(jobId, e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
+			throw new IllegalStateException(e);
 		} finally {
 			if (workDir != null) {
 				try {
