@@ -24,6 +24,24 @@ public class ProcessingProperties {
 	private String ffmpegBinary = "ffmpeg";
 
 	/**
+	 * Number of ffmpeg worker threads per export process.
+	 * 0 lets ffmpeg auto-select based on the host.
+	 */
+	private int workspaceExportFfmpegThreads = 0;
+
+	/** x264 preset for workspace export. Faster presets reduce encode time with lower compression efficiency. */
+	private String workspaceExportPreset = "veryfast";
+
+	/** x264 CRF for workspace export quality/size. Lower is higher quality and slower. */
+	private int workspaceExportCrf = 23;
+
+	/**
+	 * Parallel workers used while preparing image overlays (download + normalize).
+	 * Keep this modest to avoid saturating CPU/network under concurrent exports.
+	 */
+	private int workspaceExportImagePrepThreads = 4;
+
+	/**
 	 * Optional directory containing fonts for FFmpeg libass subtitles rendering.
 	 * Example: "/usr/share/fonts" in many Linux images.
 	 */

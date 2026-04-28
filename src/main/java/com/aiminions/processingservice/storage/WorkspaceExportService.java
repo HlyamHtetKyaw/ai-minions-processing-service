@@ -20,6 +20,10 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 import java.util.Map;
 import java.util.regex.Matcher;
@@ -149,6 +153,16 @@ public class WorkspaceExportService {
 
 		List<String> args = new ArrayList<>();
 		args.add("-y");
+		int ffmpegThreads = Math.max(0, processingProperties.getWorkspaceExportFfmpegThreads());
+		log.info("FFmpeg threads: {}", ffmpegThreads);
+		if (ffmpegThreads > 0) {
+			args.add("-threads");
+			args.add(String.valueOf(ffmpegThreads));
+			args.add("-filter_threads");
+			args.add(String.valueOf(ffmpegThreads));
+			args.add("-filter_complex_threads");
+			args.add(String.valueOf(ffmpegThreads));
+		}
 		if (!plan.multi()) {
 			double t0 = plan.segments().get(0)[0];
 			if (t0 > 0) {
@@ -211,9 +225,14 @@ public class WorkspaceExportService {
 		args.add("-c:v");
 		args.add("libx264");
 		args.add("-preset");
-		args.add("veryfast");
+		String preset = processingProperties.getWorkspaceExportPreset();
+		if (preset == null || preset.isBlank()) {
+			preset = "veryfast";
+		}
+		args.add(preset.trim());
 		args.add("-crf");
-		args.add("23");
+		int crf = Math.max(10, Math.min(35, processingProperties.getWorkspaceExportCrf()));
+		args.add(String.valueOf(crf));
 		args.add("-c:a");
 		args.add("aac");
 		args.add("-movflags");
@@ -1034,30 +1053,63 @@ public class WorkspaceExportService {
 		if (!imageLayers.isArray()) {
 			return out;
 		}
+		List<JsonNode> layers = new ArrayList<>();
 		for (JsonNode layer : imageLayers) {
-			String src = ObjectStorageTransferService.stripUrlFragmentForDownload(readText(layer, "src", ""));
-			if (src == null || src.isBlank()) {
-				continue;
+			layers.add(layer);
+		}
+		if (layers.isEmpty()) return out;
+
+		int workers = Math.max(1, processingProperties.getWorkspaceExportImagePrepThreads());
+		workers = Math.min(workers, Math.max(1, layers.size()));
+		ExecutorService pool = Executors.newFixedThreadPool(workers);
+		try {
+			List<CompletableFuture<ImageInput>> futures = new ArrayList<>();
+			for (int i = 0; i < layers.size(); i++) {
+				final int idx = i;
+				final JsonNode layer = layers.get(i);
+				futures.add(CompletableFuture.supplyAsync(() -> prepareImageInput(layer, idx, workDir), pool));
 			}
-			try {
-				Path downloaded = objectStorageTransferService.download(src, workDir);
-				boolean animatedGif = isLikelyAnimatedGif(src, downloaded);
-				if (animatedGif) {
-					Path normalized = workDir.resolve("layer-image-" + out.size() + ".gif");
-					Files.copy(downloaded, normalized, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-					out.add(new ImageInput(layer, normalized, true));
-				} else {
-					Path normalized = workDir.resolve("layer-image-" + out.size() + ".png");
-					ffmpegRunner.run(
-							List.of("-y", "-i", downloaded.toString(), "-frames:v", "1", normalized.toString()));
-					out.add(new ImageInput(layer, normalized, false));
+			for (CompletableFuture<ImageInput> f : futures) {
+				try {
+					ImageInput input = f.get();
+					if (input != null) {
+						out.add(input);
+					}
+				} catch (Exception e) {
+					// Keep export resilient: image overlay failures should not fail the entire export.
+					log.warn("Skipping one image overlay after async preparation failure", e);
 				}
-			} catch (Exception e) {
-				// Many external hosts (e.g. Pinterest) block non-browser fetches. Skip overlay instead of failing export.
-				log.warn("Skipping image overlay; could not download or decode: {}", src, e);
+			}
+		} finally {
+			pool.shutdown();
+			if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
+				pool.shutdownNow();
 			}
 		}
 		return out;
+	}
+
+	private ImageInput prepareImageInput(JsonNode layer, int index, Path workDir) {
+		String src = ObjectStorageTransferService.stripUrlFragmentForDownload(readText(layer, "src", ""));
+		if (src == null || src.isBlank()) {
+			return null;
+		}
+		try {
+			Path downloaded = objectStorageTransferService.download(src, workDir);
+			boolean animatedGif = isLikelyAnimatedGif(src, downloaded);
+			if (animatedGif) {
+				Path normalized = workDir.resolve("layer-image-" + index + ".gif");
+				Files.copy(downloaded, normalized, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+				return new ImageInput(layer, normalized, true);
+			}
+			Path normalized = workDir.resolve("layer-image-" + index + ".png");
+			ffmpegRunner.run(List.of("-y", "-i", downloaded.toString(), "-frames:v", "1", normalized.toString()));
+			return new ImageInput(layer, normalized, false);
+		} catch (Exception e) {
+			// Many external hosts (e.g. Pinterest) block non-browser fetches. Skip overlay instead of failing export.
+			log.warn("Skipping image overlay; could not download or decode: {}", src, e);
+			return null;
+		}
 	}
 
 	/**
