@@ -14,7 +14,7 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.domain.Range;
 import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -28,7 +28,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 @Component
-@ConditionalOnBean(StringRedisTemplate.class)
+@ConditionalOnProperty(name = "app.processing.queue-mode", havingValue = "stream", matchIfMissing = true)
 @RequiredArgsConstructor
 @Slf4j
 public class RedisStreamJobConsumerService {
@@ -49,6 +49,7 @@ public class RedisStreamJobConsumerService {
             log.info("Redis stream consumers disabled via app.processing.consume-jobs=false");
             return;
         }
+        log.info("Starting Redis stream consumers");
         running.set(true);
         workers = Executors.newFixedThreadPool(4);
         workers.submit(() -> consumeForever(
@@ -111,9 +112,21 @@ public class RedisStreamJobConsumerService {
                     continue;
                 }
                 for (MapRecord<String, Object, Object> record : records) {
+                    log.debug(
+                            "[redis-stream][consume] stream={} group={} consumer={} recordId={} mapKeys={}",
+                            stream,
+                            group,
+                            consumerName,
+                            record.getId() != null ? record.getId().getValue() : "null",
+                            record.getValue() != null ? record.getValue().keySet() : List.of());
                     processRecord(stream, group, dlqStream, record, handler);
                 }
             } catch (Exception ex) {
+                if (looksLikeNoGroup(ex)) {
+                    log.warn("Missing consumer group for stream={}, group={}; recreating", stream, group);
+                    ensureGroup(stream, group);
+                    continue;
+                }
                 log.error("Stream consumer loop error stream={} group={}", stream, group, ex);
             }
         }
@@ -132,7 +145,23 @@ public class RedisStreamJobConsumerService {
         String jobType = asString(map.get("jobType"));
         int attempts = parseInt(asString(map.get("attempts")));
         String doneKey = "ai-minions:stream:processed:" + jobType + ":" + jobId;
+        log.info(
+                "[redis-stream][record] stream={} group={} recordId={} jobType={} jobId={} attempts={} dlqStream={}",
+                stream,
+                group,
+                record.getId() != null ? record.getId().getValue() : "null",
+                jobType,
+                jobId,
+                attempts,
+                dlqStream);
         if (!jobId.isBlank() && Boolean.FALSE.equals(redis.opsForValue().setIfAbsent(doneKey, "in-progress", Duration.ofHours(2)))) {
+            log.info(
+                    "[redis-stream][dedupe] stream={} group={} recordId={} jobType={} jobId={} action=ack_duplicate",
+                    stream,
+                    group,
+                    record.getId() != null ? record.getId().getValue() : "null",
+                    jobType,
+                    jobId);
             redis.opsForStream().acknowledge(stream, group, record.getId());
             return;
         }
@@ -142,12 +171,30 @@ public class RedisStreamJobConsumerService {
                 redis.opsForValue().set(doneKey, record.getId().getValue(), Duration.ofDays(7));
             }
             redis.opsForStream().acknowledge(stream, group, record.getId());
+            log.info(
+                    "[redis-stream][ack] stream={} group={} recordId={} jobType={} jobId={} attempts={} result=success",
+                    stream,
+                    group,
+                    record.getId() != null ? record.getId().getValue() : "null",
+                    jobType,
+                    jobId,
+                    attempts);
         } catch (Exception ex) {
             if (!jobId.isBlank()) {
                 redis.delete(doneKey);
             }
             int nextAttempts = attempts + 1;
             if (nextAttempts >= Math.max(1, props.getRedisStreamMaxAttempts())) {
+                log.error(
+                        "[redis-stream][dlq] stream={} group={} recordId={} jobType={} jobId={} attempts={} maxAttempts={} error={}",
+                        stream,
+                        group,
+                        record.getId() != null ? record.getId().getValue() : "null",
+                        jobType,
+                        jobId,
+                        nextAttempts,
+                        props.getRedisStreamMaxAttempts(),
+                        safe(ex.getMessage()));
                 redis.opsForStream().add(StreamRecords.newRecord().in(dlqStream).ofMap(Map.of(
                         "jobId", jobId,
                         "jobType", asString(map.get("jobType")),
@@ -157,6 +204,15 @@ public class RedisStreamJobConsumerService {
                         "sourceRecordId", record.getId().getValue()
                 )));
             } else {
+                log.warn(
+                        "[redis-stream][retry] stream={} group={} recordId={} jobType={} jobId={} nextAttempts={} error={}",
+                        stream,
+                        group,
+                        record.getId() != null ? record.getId().getValue() : "null",
+                        jobType,
+                        jobId,
+                        nextAttempts,
+                        safe(ex.getMessage()));
                 redis.opsForStream().add(StreamRecords.newRecord().in(stream).ofMap(Map.of(
                         "jobId", jobId,
                         "jobType", asString(map.get("jobType")),
@@ -171,8 +227,21 @@ public class RedisStreamJobConsumerService {
     private void ensureGroup(String stream, String group) {
         try {
             redis.opsForStream().createGroup(stream, ReadOffset.latest(), group);
+            log.info("Created stream group stream={} group={}", stream, group);
         } catch (Exception ignored) {
-            // Group likely exists.
+            // If the stream does not yet exist, bootstrap it then create the group.
+            try {
+                redis.opsForStream().add(StreamRecords.newRecord().in(stream).ofMap(Map.of(
+                        "_bootstrap", "1"
+                )));
+                redis.opsForStream().createGroup(stream, ReadOffset.latest(), group);
+                log.info("Bootstrapped stream and created group stream={} group={}", stream, group);
+            } catch (Exception second) {
+                // Group may already exist, or Redis may be unavailable.
+                if (!looksLikeBusyGroup(second)) {
+                    log.warn("Could not ensure stream group stream={} group={}: {}", stream, group, second.toString());
+                }
+            }
         }
     }
 
@@ -208,5 +277,17 @@ public class RedisStreamJobConsumerService {
 
     private static String asString(Object value) {
         return value == null ? "" : String.valueOf(value);
+    }
+
+    private static boolean looksLikeNoGroup(Exception ex) {
+        if (ex == null || ex.getMessage() == null) return false;
+        String msg = ex.getMessage().toLowerCase();
+        return msg.contains("nogroup");
+    }
+
+    private static boolean looksLikeBusyGroup(Exception ex) {
+        if (ex == null || ex.getMessage() == null) return false;
+        String msg = ex.getMessage().toLowerCase();
+        return msg.contains("busygroup");
     }
 }

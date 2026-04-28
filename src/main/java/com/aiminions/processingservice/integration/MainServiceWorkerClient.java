@@ -72,6 +72,16 @@ public class MainServiceWorkerClient {
 		if (mbAudio != null) body.put("mbAudio", normalize(mbAudio));
 		if (mbVideo != null) body.put("mbVideo", normalize(mbVideo));
 		try {
+			log.info(
+					"[transcribe][callback][request] generationId={} status={} mainBaseUrl={} hasOutputData={} tokenIn={} tokenOut={} mbAudio={} mbVideo={}",
+					generationId,
+					status,
+					processingProperties.getMainServiceBaseUrl(),
+					outputData != null && !outputData.isBlank(),
+					tokenIn,
+					tokenOut,
+					mbAudio,
+					mbVideo);
 			restClient.post()
 					.uri("/api/v1/internal/worker/generations/{id}/completion", generationId)
 					.header(WORKER_TOKEN_HEADER, token.trim())
@@ -79,6 +89,7 @@ public class MainServiceWorkerClient {
 					.body(body)
 					.retrieve()
 					.toBodilessEntity();
+			log.info("[transcribe][callback][ok] generationId={} status={}", generationId, status);
 		} catch (Exception e) {
 			log.error("Main-service completion callback failed for generation {}", generationId, e);
 			throw e;

@@ -5,12 +5,14 @@ import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.redis.listener.ChannelTopic;
 import org.springframework.data.redis.listener.RedisMessageListenerContainer;
 import org.springframework.stereotype.Component;
 
 @Component
 @ConditionalOnBean(RedisMessageListenerContainer.class)
+@ConditionalOnProperty(name = "app.processing.queue-mode", havingValue = "pubsub")
 @RequiredArgsConstructor
 @Slf4j
 public class SubtitleJobRedisSubscription {

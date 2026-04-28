@@ -23,7 +23,9 @@ public class WorkspaceExportPipeline {
     public void run(WorkspaceExportJobMessage msg) {
         long jobId = msg.jobId() != null ? msg.jobId() : msg.aiGenerationId();
         try {
+            generationStatusPublisher.publishProcessing(jobId, "workspace_export_started");
             JsonNode payload = objectMapper.readTree(msg.payloadJson());
+            generationStatusPublisher.publishProcessing(jobId, "workspace_export_encoding");
             WorkspaceExportResponse res = workspaceExportService.exportVideo(msg.userId(), payload);
             ObjectNode output = objectMapper.createObjectNode();
             output.put("type", "workspace_export");
@@ -31,6 +33,7 @@ public class WorkspaceExportPipeline {
             result.put("storageUrl", res.storageUrl());
             result.put("readUrl", res.readUrl());
             result.put("s3Key", res.key());
+            generationStatusPublisher.publishProcessing(jobId, "workspace_export_uploading");
             String outputJson = objectMapper.writeValueAsString(output);
             generationStatusPublisher.publishCompleted(jobId, outputJson);
             mainServiceWorkerClient.notifyCompletion(jobId, "completed", null, outputJson);

@@ -40,10 +40,23 @@ public class TranscribePipeline {
 		long jobId = msg.jobId() != null ? msg.jobId() : msg.aiGenerationId();
 		Path workDir = null;
 		try {
+			log.info(
+					"[transcribe][start] jobId={} userId={} aiGenerationId={} sourceType={} storageUrl={} s3Key={}",
+					jobId,
+					msg.userId(),
+					msg.aiGenerationId(),
+					msg.sourceType(),
+					msg.storageUrl(),
+					msg.s3Key());
 			workDir = Files.createTempDirectory("transcribe-" + jobId + "-");
 			generationStatusPublisher.publishProcessing(jobId, "download");
 			Path input = objectStorageTransferService.download(msg.storageUrl(), workDir);
 			BigDecimal inputMb = bytesToMbSafe(input);
+			log.info(
+					"[transcribe][downloaded] jobId={} inputPath={} inputMb={}",
+					jobId,
+					input,
+					inputMb);
 
 			Path normalized = workDir.resolve("normalized.wav");
 			String sourceType = msg.sourceType() == null ? "audio" : msg.sourceType().trim().toLowerCase();
@@ -61,6 +74,7 @@ public class TranscribePipeline {
 						"-ac",
 						"1",
 						normalized.toString()));
+				log.info("[transcribe][extract_audio][done] jobId={} normalizedPath={}", jobId, normalized);
 			} else {
 				generationStatusPublisher.publishProcessing(jobId, "normalize_audio");
 				ffmpegRunner.run(List.of(
@@ -74,6 +88,7 @@ public class TranscribePipeline {
 						"-ac",
 						"1",
 						normalized.toString()));
+				log.info("[transcribe][normalize_audio][done] jobId={} normalizedPath={}", jobId, normalized);
 			}
 
 			Path cleaned = workDir.resolve("cleaned.wav");
@@ -84,10 +99,18 @@ public class TranscribePipeline {
 					processingProperties.getSilenceStopDurationSeconds(),
 					processingProperties.getSilenceStopThreshold());
 			ffmpegRunner.run(List.of("-y", "-i", normalized.toString(), "-af", silenceremove, cleaned.toString()));
+			log.info("[transcribe][silence_removal][done] jobId={} cleanedPath={}", jobId, cleaned);
 
 			generationStatusPublisher.publishProcessing(jobId, "ai_transcription");
 			byte[] cleanedWav = Files.readAllBytes(cleaned);
+			log.info("[transcribe][ai_request] jobId={} cleanedWavBytes={}", jobId, cleanedWav.length);
 			JsonNode aiData = aiServiceTranscribeClient.requestTranscriptionWithAudio(jobId, cleanedWav);
+			log.info(
+					"[transcribe][ai_response] jobId={} usedProvider={} featureType={} hasResult={}",
+					jobId,
+					aiData.path("usedProvider").asText(""),
+					aiData.path("featureType").asText(""),
+					aiData.hasNonNull("result"));
 
 			ObjectNode outputDataNode = objectMapper.createObjectNode();
 			outputDataNode.put("type", "transcribe");

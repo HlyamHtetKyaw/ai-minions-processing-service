@@ -43,6 +43,12 @@ public class AiServiceTranscribeClient {
 	}
 
 	public JsonNode requestTranscriptionWithAudio(long generationId, byte[] audioWav) throws JsonProcessingException {
+		log.info(
+				"[transcribe][ai-client][request] generationId={} aiBaseUrl={} audioBytes={} path={}",
+				generationId,
+				processingProperties.getAiServiceBaseUrl(),
+				audioWav != null ? audioWav.length : 0,
+				GENERATE_PATH);
 		ObjectNode payload = objectMapper.createObjectNode();
 		payload.put("operation", "transcribe");
 		payload.put("generationId", generationId);
@@ -70,11 +76,20 @@ public class AiServiceTranscribeClient {
 				.body(mb.build())
 				.retrieve()
 				.body(String.class);
+		log.debug(
+				"[transcribe][ai-client][raw-response] generationId={} responseBytes={}",
+				generationId,
+				raw != null ? raw.length() : 0);
 		if (raw == null || raw.isBlank()) {
 			throw new IllegalStateException("Empty response from AI service");
 		}
 		JsonNode root = objectMapper.readTree(raw);
 		if (root.path("success").asInt() != 1) {
+			log.error(
+					"[transcribe][ai-client][error] generationId={} code={} message={}",
+					generationId,
+					root.path("code").asInt(),
+					root.path("message").asText("unknown"));
 			throw new IllegalStateException(
 					"AI service error: " + root.path("message").asText("unknown") + " (code=" + root.path("code").asInt() + ")");
 		}
@@ -82,6 +97,11 @@ public class AiServiceTranscribeClient {
 		if (data == null || data.isNull()) {
 			throw new IllegalStateException("AI service response missing data");
 		}
+		log.info(
+				"[transcribe][ai-client][ok] generationId={} usedProvider={} featureType={}",
+				generationId,
+				data.path("usedProvider").asText(""),
+				data.path("featureType").asText(""));
 		return data;
 	}
 }
