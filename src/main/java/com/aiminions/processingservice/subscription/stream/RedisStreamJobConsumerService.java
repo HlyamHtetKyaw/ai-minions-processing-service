@@ -49,6 +49,7 @@ public class RedisStreamJobConsumerService {
             log.info("Redis stream consumers disabled via app.processing.consume-jobs=false");
             return;
         }
+        log.info("Starting Redis stream consumers");
         running.set(true);
         workers = Executors.newFixedThreadPool(4);
         workers.submit(() -> consumeForever(
@@ -114,6 +115,11 @@ public class RedisStreamJobConsumerService {
                     processRecord(stream, group, dlqStream, record, handler);
                 }
             } catch (Exception ex) {
+                if (looksLikeNoGroup(ex)) {
+                    log.warn("Missing consumer group for stream={}, group={}; recreating", stream, group);
+                    ensureGroup(stream, group);
+                    continue;
+                }
                 log.error("Stream consumer loop error stream={} group={}", stream, group, ex);
             }
         }
@@ -171,8 +177,21 @@ public class RedisStreamJobConsumerService {
     private void ensureGroup(String stream, String group) {
         try {
             redis.opsForStream().createGroup(stream, ReadOffset.latest(), group);
+            log.info("Created stream group stream={} group={}", stream, group);
         } catch (Exception ignored) {
-            // Group likely exists.
+            // If the stream does not yet exist, bootstrap it then create the group.
+            try {
+                redis.opsForStream().add(StreamRecords.newRecord().in(stream).ofMap(Map.of(
+                        "_bootstrap", "1"
+                )));
+                redis.opsForStream().createGroup(stream, ReadOffset.latest(), group);
+                log.info("Bootstrapped stream and created group stream={} group={}", stream, group);
+            } catch (Exception second) {
+                // Group may already exist, or Redis may be unavailable.
+                if (!looksLikeBusyGroup(second)) {
+                    log.warn("Could not ensure stream group stream={} group={}: {}", stream, group, second.toString());
+                }
+            }
         }
     }
 
@@ -208,5 +227,17 @@ public class RedisStreamJobConsumerService {
 
     private static String asString(Object value) {
         return value == null ? "" : String.valueOf(value);
+    }
+
+    private static boolean looksLikeNoGroup(Exception ex) {
+        if (ex == null || ex.getMessage() == null) return false;
+        String msg = ex.getMessage().toLowerCase();
+        return msg.contains("nogroup");
+    }
+
+    private static boolean looksLikeBusyGroup(Exception ex) {
+        if (ex == null || ex.getMessage() == null) return false;
+        String msg = ex.getMessage().toLowerCase();
+        return msg.contains("busygroup");
     }
 }
