@@ -95,6 +95,47 @@ public class AiServiceSubtitlesClient {
 		return data;
 	}
 
+	public JsonNode requestRefinedSrt(
+			long generationId,
+			String srtText,
+			String translatedText,
+			String targetLanguage,
+			String style
+	) throws JsonProcessingException {
+		ObjectNode payload = objectMapper.createObjectNode();
+		payload.put("operation", "subtitles_srt_refine");
+		payload.put("generationId", generationId);
+		payload.put("srtText", srtText == null ? "" : srtText);
+		payload.put("translatedText", translatedText == null ? "" : translatedText);
+		payload.put("targetLanguage", targetLanguage == null ? "my" : targetLanguage.trim());
+		payload.put("styleProfile", normalizeStyleProfile(style));
+
+		ObjectNode requestRoot = objectMapper.createObjectNode();
+		requestRoot.put("featureType", "SUBTITLES");
+		requestRoot.put("provider", "GEMINI");
+		requestRoot.set("payload", payload);
+
+		String raw = restClient.post()
+				.uri(GENERATE_PATH)
+				.contentType(MediaType.APPLICATION_JSON)
+				.body(requestRoot)
+				.retrieve()
+				.body(String.class);
+		if (raw == null || raw.isBlank()) {
+			throw new IllegalStateException("Empty response from AI service refine");
+		}
+		JsonNode root = objectMapper.readTree(raw);
+		if (root.path("success").asInt() != 1) {
+			throw new IllegalStateException(
+					"AI service refine error: " + root.path("message").asText("unknown") + " (code=" + root.path("code").asInt() + ")");
+		}
+		JsonNode data = root.get("data");
+		if (data == null || data.isNull()) {
+			throw new IllegalStateException("AI service refine response missing data");
+		}
+		return data;
+	}
+
 	private static String normalizeStyleProfile(String style) {
 		String s = style == null ? "" : style.trim();
 		if (s.isBlank()) {
