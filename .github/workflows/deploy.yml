@@ -35,7 +35,7 @@ jobs:
         run: |
           scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=yes \
             target/processingservice-0.0.1-SNAPSHOT.jar \
-            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/home/flypay66/jars/processing-service.jar"
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/home/root/jars/processing-service.jar"
 
       - name: Restart service
         run: |

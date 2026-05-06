@@ -146,7 +146,31 @@ public class SubtitlePipeline {
 			}
 
 			List<SrtFormatter.Cue> merged = mergeCues(allCues);
+
 			String srt = SrtFormatter.toSrt(merged);
+			String translatedText = msg.translatedText() == null ? "" : msg.translatedText().trim();
+			if (!translatedText.isBlank() && !srt.isBlank()) {
+				try {
+					generationStatusPublisher.publishProcessing(jobId, "ai_refine_srt");
+					JsonNode refinedData = aiServiceSubtitlesClient.requestRefinedSrt(
+							jobId,
+							srt,
+							translatedText,
+							targetLanguage,
+							style);
+					String refinedSrt = refinedData.path("result").path("srtText").asText("").trim();
+					if (!refinedSrt.isBlank()) {
+						log.info("Subtitle job {} refined first-pass SRT with translated text ({} chars)",
+								jobId, translatedText.length());
+						srt = refinedSrt;
+					} else {
+						log.warn("Subtitle job {} received empty refined SRT, keeping first-pass output", jobId);
+					}
+				} catch (Exception refineEx) {
+					log.warn("Subtitle job {} failed second-pass SRT refine, keeping first-pass output: {}",
+							jobId, refineEx.getMessage());
+				}
+			}
 			if (srt.isBlank()) {
 				throw new IllegalStateException("No subtitle cues were generated");
 			}

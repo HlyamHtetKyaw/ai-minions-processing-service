@@ -10,6 +10,7 @@ public record SubtitleJobMessage(
 		@JsonProperty("s3Key") String s3Key,
 		@JsonProperty("sourceType") String sourceType,
 		@JsonProperty("targetLanguage") String targetLanguage,
-		@JsonProperty("style") String style) {
+		@JsonProperty("style") String style,
+		@JsonProperty("translatedText") String translatedText) {
 }
 
