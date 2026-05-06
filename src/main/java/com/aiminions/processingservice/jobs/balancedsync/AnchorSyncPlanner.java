@@ -3,9 +3,23 @@ package com.aiminions.processingservice.jobs.balancedsync;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.aiminions.processingservice.jobs.balancedsync.SilenceAnchorChunker.SceneChunk;
 
 public final class AnchorSyncPlanner {
+
+	private static final Logger log = LoggerFactory.getLogger(AnchorSyncPlanner.class);
+
+	/**
+	 * Practical bias so the encoded video timeline is slightly longer than decoded audio EOF;
+	 * {@code -shortest} then trims redundant video tail instead of clipping narration.
+	 * (Tunable for deployment if needed.)
+	 */
+	private static final long FRAME_QUANTIZATION_BUFFER_MS = 100L;
+
+	private static final double MULTIPLIER_WARN_EXTREME = 4.0d;
 
 	private AnchorSyncPlanner() {}
 
@@ -17,8 +31,7 @@ public final class AnchorSyncPlanner {
 			long srcStartMs,
 			long srcEndMs,
 			long targetDurationMs,
-			double setptsMultiplier,
-			long holdTailMs
+			double setptsMultiplier
 	) {
 	}
 
@@ -32,17 +45,21 @@ public final class AnchorSyncPlanner {
 
 	/**
 	 * Builds a segment-by-segment plan following the business rules:
-	 * - Chunk by anchor gaps (> anchorGapMs) in both SRTs.\n
-	 * - Match chunks sequentially.\n
-	 * - Talking chunks: retime video with setpts multiplier = voiceDur/originalDur.\n
-	 * - Anchor gaps: keep video at 1.0x (no setpts), but re-encode for concat stability.\n
-	 * - If Voice has more chunks: hold last frame (tpad) for remaining audio time.\n
-	 * - If Original has more chunks: drop remaining video.\n
+	 * - Chunk by anchor gaps ({@code anchorGapMs}) in both SRTs.
+	 * - Match chunks sequentially.
+	 * - Talking chunks: retime video with {@code setpts} multiplier {@code voiceDur/originalDur}.
+	 * - Anchor gaps: keep video at 1.0× (no setpts stretch), but re-encode for concat stability.
+	 * - If Original has more chunks than Voice: drop remaining video (pairs up to {@code common}).
+	 *
+	 * @param leadPadMs     lead video padding (ms) applied on segment index 0 in the pipeline — single source of truth
+	 * @param trueVoiceDurationMs physical narration length from ffprobe — used to stretch the last TALK segment instead of tail tpad
 	 */
 	public static PlanResult build(
 			List<SrtParser.Cue> originalCues,
 			List<SrtParser.Cue> voiceCues,
-			long anchorGapMs
+			long anchorGapMs,
+			long trueVoiceDurationMs,
+			long leadPadMs
 	) {
 		List<SceneChunk> oChunks = SilenceAnchorChunker.chunk(originalCues, anchorGapMs);
 		List<SceneChunk> vChunks = SilenceAnchorChunker.chunk(voiceCues, anchorGapMs);
@@ -68,8 +85,7 @@ public final class AnchorSyncPlanner {
 					o.startMs(),
 					o.endMs(),
 					vDur,
-					mul,
-					0
+					mul
 			));
 
 			// Gap after this chunk (except after last mapped chunk): keep original timing.
@@ -85,8 +101,7 @@ public final class AnchorSyncPlanner {
 							gapStart,
 							gapEnd,
 							gapDur,
-							1.0d,
-							0
+							1.0d
 					));
 				}
 			}
@@ -94,24 +109,76 @@ public final class AnchorSyncPlanner {
 
 		long voiceEndMs = lastEndMs(voiceCues);
 		long originalEndMs = lastEndMs(originalCues);
-		long plannedVideoMs = estimatePlannedDurationMs(out);
 
-		// If voice is longer than the planned video, hold last frame (tail pad) on final segment.
-		long extra = Math.max(0, voiceEndMs - plannedVideoMs);
-		if (extra > 0 && !out.isEmpty()) {
-			SegmentPlan last = out.get(out.size() - 1);
-			out.set(out.size() - 1, new SegmentPlan(
-					last.index(),
-					last.kind(),
-					last.srcStartMs(),
-					last.srcEndMs(),
-					last.targetDurationMs(),
-					last.setptsMultiplier(),
-					extra
-			));
-		}
+		stretchLastTalkForTrueVoice(out, trueVoiceDurationMs, leadPadMs);
 
 		return new PlanResult(out, oChunks.size(), vChunks.size(), originalEndMs, voiceEndMs);
+	}
+
+	/**
+	 * Walks backwards for last {@link SegmentKind#TALK}; aligns its output duration to physical voice length.
+	 */
+	private static void stretchLastTalkForTrueVoice(List<SegmentPlan> out, long trueVoiceDurationMs, long leadPadMs) {
+		int lastTalkIdx = -1;
+		for (int i = out.size() - 1; i >= 0; i--) {
+			if (out.get(i).kind() == SegmentKind.TALK) {
+				lastTalkIdx = i;
+				break;
+			}
+		}
+		if (lastTalkIdx < 0) {
+			log.warn("balanced-sync plan: no TALK segment; skipping true-voice tail stretch");
+			return;
+		}
+
+		long prior = Math.max(0L, leadPadMs);
+		for (int i = 0; i < lastTalkIdx; i++) {
+			prior += Math.max(0L, out.get(i).targetDurationMs());
+		}
+
+		long requiredFinalChunkMs = trueVoiceDurationMs - prior + FRAME_QUANTIZATION_BUFFER_MS;
+
+		SegmentPlan lastTalk = out.get(lastTalkIdx);
+		if (requiredFinalChunkMs <= lastTalk.targetDurationMs()) {
+			log.debug(
+					"balanced-sync tail: no stretch (requiredFinal={} ms <= paired target={} ms; prior={} ms, trueVoice={} ms)",
+					requiredFinalChunkMs,
+					lastTalk.targetDurationMs(),
+					prior,
+					trueVoiceDurationMs);
+			return;
+		}
+
+		long srcDurationMs = Math.max(1L, lastTalk.srcEndMs() - lastTalk.srcStartMs());
+		double multiplier = ((double) requiredFinalChunkMs) / ((double) srcDurationMs);
+		if (!Double.isFinite(multiplier) || multiplier <= 0d) {
+			log.warn("balanced-sync tail: invalid multiplier {}; keeping paired segment", multiplier);
+			return;
+		}
+
+		log.info(
+				"balanced-sync tail: stretching last TALK idx={}: targetMs {}→{}, srcDurMs={}, setptsMultiplier={}",
+				lastTalkIdx,
+				lastTalk.targetDurationMs(),
+				requiredFinalChunkMs,
+				srcDurationMs,
+				multiplier);
+		if (multiplier > MULTIPLIER_WARN_EXTREME) {
+			log.warn(
+					"balanced-sync tail: extreme slowdown (multiplier {} > {}); preview may look very slow-motion",
+					multiplier,
+					MULTIPLIER_WARN_EXTREME);
+		}
+
+		out.set(
+				lastTalkIdx,
+				new SegmentPlan(
+						lastTalk.index(),
+						lastTalk.kind(),
+						lastTalk.srcStartMs(),
+						lastTalk.srcEndMs(),
+						requiredFinalChunkMs,
+						multiplier));
 	}
 
 	private static long lastEndMs(List<SrtParser.Cue> cues) {
@@ -124,15 +191,4 @@ public final class AnchorSyncPlanner {
 		return max;
 	}
 
-	private static long estimatePlannedDurationMs(List<SegmentPlan> plans) {
-		long sum = 0;
-		for (SegmentPlan p : plans) {
-			if (p == null) continue;
-			long dur = p.kind() == SegmentKind.TALK ? Math.max(0, p.targetDurationMs()) : Math.max(0, p.targetDurationMs());
-			sum += dur;
-			sum += Math.max(0, p.holdTailMs());
-		}
-		return sum;
-	}
 }
-

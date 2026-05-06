@@ -2,6 +2,7 @@ package com.aiminions.processingservice.media.ffmpeg;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -124,5 +125,59 @@ public class FfmpegRunner {
 	}
 
 	public record RunResult(int exitCode, String output) {
+	}
+
+	/**
+	 * Parses container format duration via ffprobe (seconds float → milliseconds).
+	 * Uses {@link ProcessingProperties#getFfprobeBinary()}.
+	 *
+	 * @throws IllegalStateException if ffprobe fails or duration is missing / non-positive
+	 */
+	public long getMediaDurationMillis(Path mediaFile) throws IOException, InterruptedException {
+		List<String> args = List.of(
+				"-v", "error",
+				"-show_entries", "format=duration",
+				"-of", "default=noprint_wrappers=1:nokey=1",
+				mediaFile.toAbsolutePath().toString());
+		RunResult r = runFfprobeRaw(args, 2, TimeUnit.MINUTES);
+		if (r.exitCode() != 0) {
+			throw new IllegalStateException("ffprobe exited with " + r.exitCode() + ": " + truncate(r.output(), 2000));
+		}
+		String first = r.output() == null ? "" : r.output().trim().lines().findFirst().orElse("").trim();
+		if (first.isEmpty()) {
+			throw new IllegalStateException("ffprobe returned no duration for " + mediaFile);
+		}
+		double seconds;
+		try {
+			seconds = Double.parseDouble(first);
+		} catch (NumberFormatException e) {
+			throw new IllegalStateException("ffprobe duration not parseable: \"" + first + "\"", e);
+		}
+		if (!Double.isFinite(seconds) || seconds <= 0) {
+			throw new IllegalStateException("ffprobe returned invalid duration: " + seconds);
+		}
+		long ms = Math.round(seconds * 1000d);
+		if (ms <= 0) {
+			throw new IllegalStateException("ffprobe duration rounded to non-positive ms: " + seconds);
+		}
+		log.debug("getMediaDurationMillis {} -> {} ms ({} s)", mediaFile.getFileName(), ms, seconds);
+		return ms;
+	}
+
+	private RunResult runFfprobeRaw(List<String> probeArgs, long timeout, TimeUnit unit) throws IOException, InterruptedException {
+		List<String> cmd = new ArrayList<>();
+		cmd.add(processingProperties.getFfprobeBinary());
+		cmd.addAll(probeArgs);
+		log.debug("ffprobe {}", String.join(" ", cmd));
+		ProcessBuilder pb = new ProcessBuilder(cmd);
+		pb.redirectErrorStream(true);
+		Process p = pb.start();
+		String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+		boolean finished = p.waitFor(timeout, unit);
+		if (!finished) {
+			p.destroyForcibly();
+			throw new IllegalStateException("ffprobe timed out");
+		}
+		return new RunResult(p.exitValue(), out);
 	}
 }
