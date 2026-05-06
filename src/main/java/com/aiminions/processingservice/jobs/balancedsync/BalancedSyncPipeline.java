@@ -3,7 +3,13 @@ package com.aiminions.processingservice.jobs.balancedsync;
 import com.aiminions.processingservice.integration.MainServiceWorkerClient;
 import com.aiminions.processingservice.jobs.transcribe.GenerationStatusPublisher;
 import com.aiminions.processingservice.media.ffmpeg.FfmpegRunner;
+import com.aiminions.processingservice.jobs.subtitles.SrtFormatter;
 import com.aiminions.processingservice.storage.ObjectStorageTransferService;
+import com.aiminions.processingservice.jobs.balancedsync.AnchorSyncPlanner.PlanResult;
+import com.aiminions.processingservice.jobs.balancedsync.AnchorSyncPlanner.SegmentPlan;
+import com.aiminions.processingservice.jobs.balancedsync.AnchorSyncPlanner.SegmentKind;
+import com.aiminions.processingservice.config.ProcessingProperties;
+import com.aiminions.processingservice.integration.AiServiceSubtitlesClient;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.RequiredArgsConstructor;
@@ -13,6 +19,9 @@ import org.springframework.util.FileSystemUtils;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.StandardOpenOption;
+import java.util.Comparator;
 import java.util.OptionalDouble;
 import java.util.ArrayList;
 import java.util.List;
@@ -28,9 +37,11 @@ public class BalancedSyncPipeline {
 
 	private final ObjectStorageTransferService objectStorageTransferService;
 	private final FfmpegRunner ffmpegRunner;
+	private final ProcessingProperties processingProperties;
 	private final GenerationStatusPublisher generationStatusPublisher;
 	private final MainServiceWorkerClient mainServiceWorkerClient;
 	private final ObjectMapper objectMapper;
+	private final AiServiceSubtitlesClient aiServiceSubtitlesClient;
 
 	private static final double MIN_VIDEO_RATE = 0.60d;
 	private static final double MAX_VIDEO_RATE = 1.10d;
@@ -39,45 +50,48 @@ public class BalancedSyncPipeline {
 	private static final double BALANCED_ALPHA = 0.70d;
 
 	private static final Pattern DURATION = Pattern.compile("Duration:\\s*(\\d+):(\\d+):(\\d+(?:\\.\\d+)?)");
+	private static final long ANCHOR_GAP_MS = 1500L;
+	private static final long SUBTITLES_CHUNK_SECONDS = 25L;
 
 	public void run(BalancedSyncJobMessage msg) {
 		long jobId = msg.jobId() != null ? msg.jobId() : msg.aiGenerationId();
 		Path workDir = null;
 		try {
-			workDir = Files.createTempDirectory("balanced-sync-" + jobId + "-");
+			workDir = Path.of(System.getProperty("java.io.tmpdir"), "balanced-sync-" + jobId);
+			Files.createDirectories(workDir);
 			generationStatusPublisher.publishProcessing(jobId, "download");
 			Path video = objectStorageTransferService.download(require(msg.videoStorageUrl(), "videoStorageUrl"), workDir);
 			Path voice = objectStorageTransferService.download(require(msg.voiceStorageUrl(), "voiceStorageUrl"), workDir);
 
-			// Prefer worker-measured durations for perfect alignment (browser/container metadata can drift).
-			generationStatusPublisher.publishProcessing(jobId, "probe");
-			double vd = probeDurationSeconds(video).orElse(0d);
-			double ad = probeDurationSeconds(voice).orElse(0d);
-
-			double videoRate;
-			double voiceRate;
-			double targetDurationSec;
-			if (vd > 0.01d && ad > 0.01d) {
-				SolvedRates solved = solveRates(vd, ad);
-				videoRate = solved.videoRate();
-				voiceRate = solved.voiceRate();
-				targetDurationSec = solved.targetDurationSec();
+			Path originalSrt;
+			if (msg.originalVideoSrtStorageUrl() != null && !msg.originalVideoSrtStorageUrl().isBlank()) {
+				originalSrt = objectStorageTransferService.download(msg.originalVideoSrtStorageUrl(), workDir);
 			} else {
-				// Fallback to provided values.
-				videoRate = safeRate(msg.videoRate());
-				voiceRate = safeRate(msg.voiceRate());
-				targetDurationSec = safeDuration(msg.targetDurationSec());
-				if (targetDurationSec <= 0 && vd > 0.01d) {
-					targetDurationSec = Math.max(0.01d, vd / Math.max(0.000001d, videoRate));
-				}
+				generationStatusPublisher.publishProcessing(jobId, "gen_original_srt");
+				originalSrt = generateAndUploadSrt(jobId, msg.userId(), "original", video, "video", workDir);
+			}
+
+			Path voiceSrt;
+			if (msg.voiceOverSrtStorageUrl() != null && !msg.voiceOverSrtStorageUrl().isBlank()) {
+				voiceSrt = objectStorageTransferService.download(msg.voiceOverSrtStorageUrl(), workDir);
+			} else {
+				generationStatusPublisher.publishProcessing(jobId, "gen_voice_srt");
+				voiceSrt = generateAndUploadSrt(jobId, msg.userId(), "voice", voice, "audio", workDir);
+			}
+
+			generationStatusPublisher.publishProcessing(jobId, "parse_srt");
+			String originalSrtText = Files.readString(originalSrt, StandardCharsets.UTF_8);
+			String voiceSrtText = Files.readString(voiceSrt, StandardCharsets.UTF_8);
+			List<SrtParser.Cue> originalCues = SrtParser.parse(originalSrtText);
+			List<SrtParser.Cue> voiceCues = SrtParser.parse(voiceSrtText);
+			PlanResult plan = AnchorSyncPlanner.build(originalCues, voiceCues, ANCHOR_GAP_MS);
+			if (plan.segments().isEmpty()) {
+				throw new IllegalStateException("No scene chunks found (empty SRT or anchor chunking produced 0 segments)");
 			}
 
 			Path out = workDir.resolve("balanced-" + System.currentTimeMillis() + ".mp4");
-			generationStatusPublisher.publishProcessing(jobId, "ffmpeg");
-			ffmpegRunner.run(buildFfmpegArgs(
-					video, voice, out,
-					videoRate, voiceRate, targetDurationSec,
-					msg.protectFlip(), msg.protectHueDeg()));
+			generationStatusPublisher.publishProcessing(jobId, "ffmpeg_segments");
+			runAnchorSyncFfmpeg(video, voice, out, workDir, plan, originalCues, voiceCues, msg.protectFlip(), msg.protectHueDeg());
 
 			generationStatusPublisher.publishProcessing(jobId, "upload");
 			String keyHint = "video-editor/" + (msg.userId() == null ? "unknown" : msg.userId()) + "/balanced-sync/"
@@ -91,11 +105,8 @@ public class BalancedSyncPipeline {
 			result.put("storageUrl", stored.storageUrl());
 			result.put("readUrl", readUrl);
 			result.put("s3Key", stored.key());
-			result.put("videoRate", round6(videoRate));
-			result.put("voiceRate", round6(voiceRate));
-			result.put("targetDurationSec", round6(targetDurationSec));
-			if (vd > 0) result.put("measuredVideoDurationSec", round6(vd));
-			if (ad > 0) result.put("measuredVoiceDurationSec", round6(ad));
+			result.put("originalChunkCount", plan.originalChunkCount());
+			result.put("voiceChunkCount", plan.voiceChunkCount());
 
 			String outputJson = objectMapper.writeValueAsString(output);
 			generationStatusPublisher.publishCompleted(jobId, outputJson);
@@ -189,6 +200,241 @@ public class BalancedSyncPipeline {
 	}
 
 	private record SolvedRates(double videoRate, double voiceRate, double targetDurationSec) {}
+
+	private Path generateAndUploadSrt(
+			long balancedSyncJobId,
+			Long userId,
+			String kind,
+			Path input,
+			String sourceType,
+			Path workDir
+	) throws Exception {
+		if (userId == null) {
+			throw new IllegalArgumentException("userId is required to generate subtitles");
+		}
+		String st = sourceType == null ? "audio" : sourceType.trim().toLowerCase(Locale.ROOT);
+		String targetLanguage = "my";
+		String style = "caption_rules_v1";
+
+		Path subtitleDir = workDir.resolve("subtitles-" + kind);
+		Files.createDirectories(subtitleDir);
+
+		Path normalized = subtitleDir.resolve("normalized.wav");
+		if ("video".equals(st)) {
+			ffmpegRunner.run(List.of(
+					"-y",
+					"-i", input.toString(),
+					"-vn",
+					"-acodec", "pcm_s16le",
+					"-ar", "44100",
+					"-ac", "1",
+					normalized.toString()
+			));
+		} else {
+			ffmpegRunner.run(List.of(
+					"-y",
+					"-i", input.toString(),
+					"-acodec", "pcm_s16le",
+					"-ar", "44100",
+					"-ac", "1",
+					normalized.toString()
+			));
+		}
+
+		Path chunksDir = subtitleDir.resolve("chunks");
+		Files.createDirectories(chunksDir);
+		Path chunkPattern = chunksDir.resolve("chunk-%03d.wav");
+		ffmpegRunner.run(List.of(
+				"-y",
+				"-i", normalized.toString(),
+				"-f", "segment",
+				"-segment_time", String.valueOf(SUBTITLES_CHUNK_SECONDS),
+				"-reset_timestamps", "1",
+				"-acodec", "pcm_s16le",
+				"-ar", "44100",
+				"-ac", "1",
+				chunkPattern.toString()
+		));
+
+		List<Path> chunks = Files.list(chunksDir)
+				.filter(p -> p.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".wav"))
+				.sorted(Comparator.comparing(p -> p.getFileName().toString()))
+				.toList();
+		if (chunks.isEmpty()) {
+			throw new IllegalStateException("No audio chunks were created for subtitles (" + kind + ")");
+		}
+
+		List<SrtFormatter.Cue> allCues = new ArrayList<>();
+		for (int i = 0; i < chunks.size(); i++) {
+			Path chunk = chunks.get(i);
+			byte[] bytes = Files.readAllBytes(chunk);
+			long offsetMs = (long) i * SUBTITLES_CHUNK_SECONDS * 1000L;
+			long durationMs = SUBTITLES_CHUNK_SECONDS * 1000L;
+			var aiData = aiServiceSubtitlesClient.requestSubtitleCuesWithAudio(
+					balancedSyncJobId,
+					bytes,
+					offsetMs,
+					durationMs,
+					i,
+					targetLanguage,
+					style
+			);
+			var cues = aiData.path("result").path("cues");
+			if (cues == null || !cues.isArray()) continue;
+			for (var c : cues) {
+				long startMs = c.path("startMs").asLong(-1);
+				long endMs = c.path("endMs").asLong(-1);
+				String text = c.path("text").asText("");
+				if (startMs < 0 || endMs < 0) continue;
+				allCues.add(new SrtFormatter.Cue(startMs + offsetMs, endMs + offsetMs, text));
+			}
+		}
+		if (allCues.isEmpty()) {
+			throw new IllegalStateException("No subtitle cues were generated (" + kind + ")");
+		}
+
+		// Reuse the same merge heuristics as subtitles pipeline (minimal subset).
+		List<SrtFormatter.Cue> merged = allCues.stream()
+				.filter(c -> c != null && c.text() != null && !c.text().trim().isBlank())
+				.sorted(Comparator.comparingLong(SrtFormatter.Cue::startMs).thenComparingLong(SrtFormatter.Cue::endMs))
+				.toList();
+
+		String srtText = SrtFormatter.toSrt(merged);
+		Path out = subtitleDir.resolve(kind + ".srt");
+		Files.writeString(out, srtText, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+
+		String keyHint = "subtitles/" + userId + "/balanced-sync/" + balancedSyncJobId + "-" + kind + ".srt";
+		objectStorageTransferService.uploadFile(out, keyHint, "application/x-subrip");
+		return out;
+	}
+
+	private void runAnchorSyncFfmpeg(
+			Path video,
+			Path voice,
+			Path out,
+			Path workDir,
+			PlanResult plan,
+			List<SrtParser.Cue> originalCues,
+			List<SrtParser.Cue> voiceCues,
+			Boolean protectFlip,
+			Double protectHueDeg
+	) throws Exception {
+		Path segDir = workDir.resolve("segments");
+		Files.createDirectories(segDir);
+
+		int threads = Math.max(0, processingProperties.getWorkspaceExportFfmpegThreads());
+		String preset = processingProperties.getWorkspaceExportPreset();
+		if (preset == null || preset.isBlank()) preset = "veryfast";
+		int crf = Math.max(10, Math.min(35, processingProperties.getWorkspaceExportCrf()));
+
+		// Audio offset verification (video-only): if voice SRT starts later than original SRT, pad video start.
+		long leadPadMs = Math.max(0, firstStartMs(voiceCues) - firstStartMs(originalCues));
+
+		List<Path> segmentFiles = new ArrayList<>();
+		for (int i = 0; i < plan.segments().size(); i++) {
+			SegmentPlan sp = plan.segments().get(i);
+			Path segOut = segDir.resolve(String.format(Locale.ROOT, "seg-%03d.mp4", i));
+			segmentFiles.add(segOut);
+
+			double ss = Math.max(0d, sp.srcStartMs() / 1000d);
+			double to = Math.max(ss, sp.srcEndMs() / 1000d);
+
+			List<String> vf = new ArrayList<>();
+			// Optional video-only start padding on the first segment.
+			if (i == 0 && leadPadMs > 0) {
+				vf.add("tpad=start_mode=clone:start_duration=" + fmt(leadPadMs / 1000d));
+			}
+			if (sp.kind() == SegmentKind.TALK) {
+				vf.add("setpts=" + fmt(sp.setptsMultiplier()) + "*PTS");
+				if (sp.setptsMultiplier() > 2.0d) {
+					// Slow-motion: add interpolation for smoothness.
+					vf.add("minterpolate=fps=60");
+				}
+			}
+			if (Boolean.TRUE.equals(protectFlip)) {
+				vf.add("hflip");
+			}
+			if (protectHueDeg != null && Double.isFinite(protectHueDeg) && Math.abs(protectHueDeg) > 0.0001d) {
+				vf.add("hue=h=" + fmt(protectHueDeg));
+			}
+			if (sp.holdTailMs() > 0) {
+				vf.add("tpad=stop_mode=clone:stop_duration=" + fmt(sp.holdTailMs() / 1000d));
+			}
+			// Ensure each segment has consistent timestamps starting at 0 for concat.
+			vf.add("setpts=PTS-STARTPTS");
+
+			List<String> args = new ArrayList<>();
+			args.add("-y");
+			if (threads > 0) {
+				args.add("-threads");
+				args.add(String.valueOf(threads));
+				args.add("-filter_threads");
+				args.add(String.valueOf(threads));
+				args.add("-filter_complex_threads");
+				args.add(String.valueOf(threads));
+			}
+			args.add("-ss");
+			args.add(fmt(ss));
+			args.add("-to");
+			args.add(fmt(to));
+			args.add("-i");
+			args.add(video.toString());
+			args.add("-an");
+			args.add("-vf");
+			args.add(String.join(",", vf));
+			args.add("-c:v");
+			args.add("libx264");
+			args.add("-preset");
+			args.add(preset.trim());
+			args.add("-crf");
+			args.add(String.valueOf(crf));
+			args.add("-pix_fmt");
+			args.add("yuv420p");
+			args.add(segOut.toString());
+
+			ffmpegRunner.run(args);
+		}
+
+		Path concatList = workDir.resolve("concat.txt");
+		StringBuilder sb = new StringBuilder(segmentFiles.size() * 64);
+		for (Path p : segmentFiles) {
+			sb.append("file '").append(p.toAbsolutePath().toString().replace("'", "\\'")).append("'\n");
+		}
+		Files.writeString(concatList, sb.toString(), StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+
+		Path silentMaster = workDir.resolve("silent-master.mp4");
+		ffmpegRunner.run(List.of(
+				"-y",
+				"-f", "concat",
+				"-safe", "0",
+				"-i", concatList.toString(),
+				"-c", "copy",
+				silentMaster.toString()
+		));
+
+		// Mux untouched voiceover audio. Use stream copy to keep audio bit-identical.
+		ffmpegRunner.run(List.of(
+				"-y",
+				"-i", silentMaster.toString(),
+				"-i", voice.toString(),
+				"-map", "0:v:0",
+				"-map", "1:a:0",
+				"-c:v", "copy",
+				"-c:a", "copy",
+				"-shortest",
+				out.toString()
+		));
+	}
+
+	private static long firstStartMs(List<SrtParser.Cue> cues) {
+		if (cues == null || cues.isEmpty()) return 0;
+		long min = Long.MAX_VALUE;
+		for (SrtParser.Cue c : cues) {
+			if (c == null) continue;
+			min = Math.min(min, Math.max(0, c.startMs()));
+		}
+		return min == Long.MAX_VALUE ? 0 : min;
+	}
 
 	private static double round6(double v) {
 		return Math.round(v * 1_000_000d) / 1_000_000d;
