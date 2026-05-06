@@ -38,6 +38,9 @@ public class ProcessingProperties {
 
 	private String generationStatusChannelPrefix = "ai-minions:generation:status:";
 
+	/** Must stay aligned with {@code GenerationJobChannels} on main-service. */
+	private String generationProgressLastPrefix = "ai-minions:generation:progress:last:";
+
 	private String mainServiceBaseUrl = "http://localhost:8081";
 
 	private String workerToken = "";
@@ -103,5 +106,9 @@ public class ProcessingProperties {
 
 	public String generationStatusChannel(long jobId) {
 		return generationStatusChannelPrefix + jobId;
+	}
+
+	public String generationProgressLastKey(long jobId) {
+		return generationProgressLastPrefix + jobId;
 	}
 }

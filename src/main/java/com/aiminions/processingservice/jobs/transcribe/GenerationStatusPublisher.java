@@ -1,10 +1,13 @@
 package com.aiminions.processingservice.jobs.transcribe;
 
+import java.time.Duration;
+
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 import com.aiminions.processingservice.config.ProcessingProperties;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
@@ -16,6 +19,8 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public class GenerationStatusPublisher {
 
+	private static final Duration PROGRESS_SNAPSHOT_TTL = Duration.ofHours(6);
+
 	private final StringRedisTemplate redis;
 	private final ProcessingProperties processingProperties;
 	private final ObjectMapper objectMapper;
@@ -23,12 +28,32 @@ public class GenerationStatusPublisher {
 	public void publishRaw(long jobId, String json) {
 		try {
 			redis.convertAndSend(processingProperties.generationStatusChannel(jobId), json);
+			syncProgressSnapshotKey(jobId, json);
 		} catch (Exception e) {
 			log.error(
 					"Failed to publish generation status to Redis channel {} for job {} — SSE on main-service may hang until timeout. Cause: {}",
 					processingProperties.generationStatusChannel(jobId),
 					jobId,
 					e.toString());
+		}
+	}
+
+	/**
+	 * Pub/sub is fire-and-forget; SSE clients that connect late never see earlier stages. Mirror the latest
+	 * {@code processing} payload under a key so main-service can emit it once on subscribe.
+	 */
+	private void syncProgressSnapshotKey(long jobId, String json) {
+		try {
+			String key = processingProperties.generationProgressLastKey(jobId);
+			JsonNode root = objectMapper.readTree(json);
+			String st = root.path("status").asText("").toLowerCase();
+			if ("processing".equals(st)) {
+				redis.opsForValue().set(key, json, PROGRESS_SNAPSHOT_TTL);
+			} else if ("completed".equals(st) || "failed".equals(st) || "error".equals(st)) {
+				redis.delete(key);
+			}
+		} catch (Exception e) {
+			log.debug("Could not sync generation progress snapshot key for job {}", jobId, e);
 		}
 	}
 
