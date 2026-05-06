@@ -44,6 +44,9 @@ public class ProcessingProperties {
 
 	private String ffmpegBinary = "ffmpeg";
 
+	/** ffprobe executable (often alongside ffmpeg); used for media duration probing. */
+	private String ffprobeBinary = "ffprobe";
+
 	/**
 	 * Number of ffmpeg worker threads per export process.
 	 * 0 lets ffmpeg auto-select based on the host.

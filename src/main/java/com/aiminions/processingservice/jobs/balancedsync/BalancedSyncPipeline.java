@@ -84,14 +84,21 @@ public class BalancedSyncPipeline {
 			String voiceSrtText = Files.readString(voiceSrt, StandardCharsets.UTF_8);
 			List<SrtParser.Cue> originalCues = SrtParser.parse(originalSrtText);
 			List<SrtParser.Cue> voiceCues = SrtParser.parse(voiceSrtText);
-			PlanResult plan = AnchorSyncPlanner.build(originalCues, voiceCues, ANCHOR_GAP_MS);
+			long trueVoiceDurationMs = ffmpegRunner.getMediaDurationMillis(voice);
+			long leadPadMs = Math.max(0L, firstStartMs(voiceCues) - firstStartMs(originalCues));
+			log.info(
+					"balanced-sync job {} voice physical duration {} ms (ffprobe), leadPadMs {} ms",
+					jobId,
+					trueVoiceDurationMs,
+					leadPadMs);
+			PlanResult plan = AnchorSyncPlanner.build(originalCues, voiceCues, ANCHOR_GAP_MS, trueVoiceDurationMs, leadPadMs);
 			if (plan.segments().isEmpty()) {
 				throw new IllegalStateException("No scene chunks found (empty SRT or anchor chunking produced 0 segments)");
 			}
 
 			Path out = workDir.resolve("balanced-" + System.currentTimeMillis() + ".mp4");
 			generationStatusPublisher.publishProcessing(jobId, "ffmpeg_segments");
-			runAnchorSyncFfmpeg(video, voice, out, workDir, plan, originalCues, voiceCues, msg.protectFlip(), msg.protectHueDeg());
+			runAnchorSyncFfmpeg(video, voice, out, workDir, plan, msg.protectFlip(), msg.protectHueDeg(), leadPadMs);
 
 			generationStatusPublisher.publishProcessing(jobId, "upload");
 			String keyHint = "video-editor/" + (msg.userId() == null ? "unknown" : msg.userId()) + "/balanced-sync/"
@@ -314,10 +321,9 @@ public class BalancedSyncPipeline {
 			Path out,
 			Path workDir,
 			PlanResult plan,
-			List<SrtParser.Cue> originalCues,
-			List<SrtParser.Cue> voiceCues,
 			Boolean protectFlip,
-			Double protectHueDeg
+			Double protectHueDeg,
+			long leadPadMs
 	) throws Exception {
 		Path segDir = workDir.resolve("segments");
 		Files.createDirectories(segDir);
@@ -326,9 +332,6 @@ public class BalancedSyncPipeline {
 		String preset = processingProperties.getWorkspaceExportPreset();
 		if (preset == null || preset.isBlank()) preset = "veryfast";
 		int crf = Math.max(10, Math.min(35, processingProperties.getWorkspaceExportCrf()));
-
-		// Audio offset verification (video-only): if voice SRT starts later than original SRT, pad video start.
-		long leadPadMs = Math.max(0, firstStartMs(voiceCues) - firstStartMs(originalCues));
 
 		List<Path> segmentFiles = new ArrayList<>();
 		for (int i = 0; i < plan.segments().size(); i++) {
@@ -356,9 +359,6 @@ public class BalancedSyncPipeline {
 			}
 			if (protectHueDeg != null && Double.isFinite(protectHueDeg) && Math.abs(protectHueDeg) > 0.0001d) {
 				vf.add("hue=h=" + fmt(protectHueDeg));
-			}
-			if (sp.holdTailMs() > 0) {
-				vf.add("tpad=stop_mode=clone:stop_duration=" + fmt(sp.holdTailMs() / 1000d));
 			}
 			// Ensure each segment has consistent timestamps starting at 0 for concat.
 			vf.add("setpts=PTS-STARTPTS");
