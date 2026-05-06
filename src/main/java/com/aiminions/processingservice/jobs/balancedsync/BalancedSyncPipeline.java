@@ -412,18 +412,124 @@ public class BalancedSyncPipeline {
 				silentMaster.toString()
 		));
 
-		// Mux untouched voiceover audio. Use stream copy to keep audio bit-identical.
-		ffmpegRunner.run(List.of(
-				"-y",
-				"-i", silentMaster.toString(),
-				"-i", voice.toString(),
-				"-map", "0:v:0",
-				"-map", "1:a:0",
-				"-c:v", "copy",
-				"-c:a", "copy",
-				"-shortest",
-				out.toString()
-		));
+		muxBalancedOutputNoClip(silentMaster, voice, out, threads, preset, crf);
+	}
+
+	/**
+	 * Mux stitched silent video + narration without {@code -shortest} clipping.
+	 * <ul>
+	 * <li>If video ends before voice: clone-pad video tail until voice ends (+ small slack).</li>
+	 * <li>If voice ends before video: tempo-stretch audio so its timeline matches video (no video cut).</li>
+	 * <li>If durations already align: stream copy mux.</li>
+	 * </ul>
+	 */
+	private void muxBalancedOutputNoClip(
+			Path silentMaster,
+			Path voice,
+			Path out,
+			int threads,
+			String preset,
+			int crf
+	) throws Exception {
+		long videoMs = ffmpegRunner.getMediaDurationMillis(silentMaster);
+		long voiceMs = ffmpegRunner.getMediaDurationMillis(voice);
+		if (videoMs <= 0 || voiceMs <= 0) {
+			throw new IllegalStateException("Could not probe video/voice duration for mux (videoMs=" + videoMs + ", voiceMs=" + voiceMs + ")");
+		}
+
+		final long epsilonMs = 80L;
+		final long slackPadMs = 250L;
+
+		boolean videoShorter = videoMs + epsilonMs < voiceMs;
+		boolean voiceShorter = voiceMs + epsilonMs < videoMs;
+
+		if (!videoShorter && !voiceShorter) {
+			ffmpegRunner.run(List.of(
+					"-y",
+					"-i", silentMaster.toString(),
+					"-i", voice.toString(),
+					"-map", "0:v:0",
+					"-map", "1:a:0",
+					"-c:v", "copy",
+					"-c:a", "copy",
+					out.toString()
+			));
+			return;
+		}
+
+		List<String> args = new ArrayList<>();
+		args.add("-y");
+		if (threads > 0) {
+			args.add("-threads");
+			args.add(String.valueOf(threads));
+		}
+		args.add("-i");
+		args.add(silentMaster.toString());
+		args.add("-i");
+		args.add(voice.toString());
+
+		if (videoShorter) {
+			double padSec = (voiceMs - videoMs + slackPadMs) / 1000.0;
+			padSec = Math.max(padSec, 0.04d);
+			String pad = fmt(padSec);
+			log.info(
+					"balanced-sync mux: video shorter than narration (videoMs={} voiceMs={}); padding video tail {} s",
+					videoMs,
+					voiceMs,
+					pad);
+			args.add("-filter_complex");
+			args.add("[0:v]tpad=stop_mode=clone:stop_duration=" + pad + "[v]");
+			args.add("-map");
+			args.add("[v]");
+			args.add("-map");
+			args.add("1:a:0");
+			args.add("-c:v");
+			args.add("libx264");
+			args.add("-preset");
+			args.add((preset != null && !preset.isBlank()) ? preset.trim() : "veryfast");
+			args.add("-crf");
+			args.add(String.valueOf(crf));
+			args.add("-pix_fmt");
+			args.add("yuv420p");
+			args.add("-c:a");
+			args.add("copy");
+			args.add("-movflags");
+			args.add("+faststart");
+			args.add(out.toString());
+			ffmpegRunner.run(args);
+			return;
+		}
+
+		// Voice shorter than video: speed up full video timeline to match narration (audio copied = no cut).
+		double ptsFactor = voiceMs / (double) videoMs;
+		if (!Double.isFinite(ptsFactor) || ptsFactor <= 0.00001d || ptsFactor >= 1d) {
+			throw new IllegalStateException("Invalid setpts factor for balanced mux (voiceMs=" + voiceMs + ", videoMs=" + videoMs + ")");
+		}
+		log.info(
+				"balanced-sync mux: narration shorter than video (videoMs={} voiceMs={}); setpts factor {} (faster video, full audio)",
+				videoMs,
+				voiceMs,
+				fmt(ptsFactor));
+		args.add("-filter_complex");
+		args.add("[0:v]setpts=" + fmt(ptsFactor) + "*PTS,setsar=1[v]");
+		args.add("-map");
+		args.add("[v]");
+		args.add("-map");
+		args.add("1:a:0");
+		args.add("-c:v");
+		args.add("libx264");
+		args.add("-preset");
+		args.add((preset != null && !preset.isBlank()) ? preset.trim() : "veryfast");
+		args.add("-crf");
+		args.add(String.valueOf(crf));
+		args.add("-pix_fmt");
+		args.add("yuv420p");
+		args.add("-c:a");
+		args.add("copy");
+		args.add("-movflags");
+		args.add("+faststart");
+		args.add(out.toString());
+		ffmpegRunner.run(args);
 	}
 
 	private static long firstStartMs(List<SrtParser.Cue> cues) {
