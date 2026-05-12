@@ -131,7 +131,8 @@ public class SubtitlePipeline {
 						durationMs,
 						i,
 						targetLanguage,
-						style);
+						style,
+						msg.userGeminiApiKey());
 				ArrayNode cues = (ArrayNode) aiData.path("result").path("cues");
 				if (cues == null || cues.isMissingNode() || !cues.isArray()) {
 					continue;
@@ -157,7 +158,8 @@ public class SubtitlePipeline {
 							srt,
 							translatedText,
 							targetLanguage,
-							style);
+							style,
+							msg.userGeminiApiKey());
 					String refinedSrt = refinedData.path("result").path("srtText").asText("").trim();
 					if (!refinedSrt.isBlank()) {
 						log.info("Subtitle job {} refined first-pass SRT with translated text ({} chars)",

@@ -26,6 +26,7 @@ import org.springframework.web.client.RestClient;
 public class AiServiceSubtitlesClient {
 
 	private static final String GENERATE_PATH = "/ai_service/api/v1/feature/generate";
+	private static final String USER_GEMINI_HEADER = "X-User-Gemini-Api-Key";
 
 	private final ProcessingProperties processingProperties;
 	private final ObjectMapper objectMapper;
@@ -46,7 +47,8 @@ public class AiServiceSubtitlesClient {
 			long chunkDurationMs,
 			int chunkIndex,
 			String targetLanguage,
-			String style
+			String style,
+			String userGeminiApiKey
 	) throws JsonProcessingException {
 		ObjectNode payload = objectMapper.createObjectNode();
 		payload.put("operation", "subtitles_srt_cues");
@@ -74,10 +76,13 @@ public class AiServiceSubtitlesClient {
 			}
 		}, MediaType.parseMediaType("audio/wav"));
 
-		String raw = restClient.post()
+		var req = restClient.post()
 				.uri(GENERATE_PATH)
-				.contentType(MediaType.MULTIPART_FORM_DATA)
-				.body(mb.build())
+				.contentType(MediaType.MULTIPART_FORM_DATA);
+		if (userGeminiApiKey != null && !userGeminiApiKey.isBlank()) {
+			req = req.header(USER_GEMINI_HEADER, userGeminiApiKey.trim());
+		}
+		String raw = req.body(mb.build())
 				.retrieve()
 				.body(String.class);
 		if (raw == null || raw.isBlank()) {
@@ -100,7 +105,8 @@ public class AiServiceSubtitlesClient {
 			String srtText,
 			String translatedText,
 			String targetLanguage,
-			String style
+			String style,
+			String userGeminiApiKey
 	) throws JsonProcessingException {
 		ObjectNode payload = objectMapper.createObjectNode();
 		payload.put("operation", "subtitles_srt_refine");
@@ -115,10 +121,13 @@ public class AiServiceSubtitlesClient {
 		requestRoot.put("provider", "GEMINI");
 		requestRoot.set("payload", payload);
 
-		String raw = restClient.post()
+		var req = restClient.post()
 				.uri(GENERATE_PATH)
-				.contentType(MediaType.APPLICATION_JSON)
-				.body(requestRoot)
+				.contentType(MediaType.APPLICATION_JSON);
+		if (userGeminiApiKey != null && !userGeminiApiKey.isBlank()) {
+			req = req.header(USER_GEMINI_HEADER, userGeminiApiKey.trim());
+		}
+		String raw = req.body(requestRoot)
 				.retrieve()
 				.body(String.class);
 		if (raw == null || raw.isBlank()) {

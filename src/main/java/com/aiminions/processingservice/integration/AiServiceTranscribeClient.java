@@ -29,6 +29,7 @@ import lombok.extern.slf4j.Slf4j;
 public class AiServiceTranscribeClient {
 
 	private static final String GENERATE_PATH = "/ai_service/api/v1/feature/generate";
+	private static final String USER_GEMINI_HEADER = "X-User-Gemini-Api-Key";
 
 	private final ProcessingProperties processingProperties;
 	private final ObjectMapper objectMapper;
@@ -42,7 +43,8 @@ public class AiServiceTranscribeClient {
 				.build();
 	}
 
-	public JsonNode requestTranscriptionWithAudio(long generationId, byte[] audioWav) throws JsonProcessingException {
+	public JsonNode requestTranscriptionWithAudio(long generationId, byte[] audioWav, String userGeminiApiKey)
+			throws JsonProcessingException {
 		log.info(
 				"[transcribe][ai-client][request] generationId={} aiBaseUrl={} audioBytes={} path={}",
 				generationId,
@@ -70,10 +72,13 @@ public class AiServiceTranscribeClient {
 			}
 		}, MediaType.parseMediaType("audio/wav"));
 
-		String raw = restClient.post()
+		var req = restClient.post()
 				.uri(GENERATE_PATH)
-				.contentType(MediaType.MULTIPART_FORM_DATA)
-				.body(mb.build())
+				.contentType(MediaType.MULTIPART_FORM_DATA);
+		if (userGeminiApiKey != null && !userGeminiApiKey.isBlank()) {
+			req = req.header(USER_GEMINI_HEADER, userGeminiApiKey.trim());
+		}
+		String raw = req.body(mb.build())
 				.retrieve()
 				.body(String.class);
 		log.debug(

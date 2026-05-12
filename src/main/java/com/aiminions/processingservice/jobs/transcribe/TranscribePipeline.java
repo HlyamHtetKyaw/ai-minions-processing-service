@@ -104,7 +104,7 @@ public class TranscribePipeline {
 			generationStatusPublisher.publishProcessing(jobId, "ai_transcription");
 			byte[] cleanedWav = Files.readAllBytes(cleaned);
 			log.info("[transcribe][ai_request] jobId={} cleanedWavBytes={}", jobId, cleanedWav.length);
-			JsonNode aiData = aiServiceTranscribeClient.requestTranscriptionWithAudio(jobId, cleanedWav);
+			JsonNode aiData = aiServiceTranscribeClient.requestTranscriptionWithAudio(jobId, cleanedWav, msg.userGeminiApiKey());
 			log.info(
 					"[transcribe][ai_response] jobId={} usedProvider={} featureType={} hasResult={}",
 					jobId,

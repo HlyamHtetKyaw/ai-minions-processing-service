@@ -18,7 +18,8 @@ public record BalancedSyncJobMessage(
 		@JsonProperty("videoRate") Double videoRate,
 		@JsonProperty("voiceRate") Double voiceRate,
 		@JsonProperty("protectFlip") Boolean protectFlip,
-		@JsonProperty("protectHueDeg") Double protectHueDeg
+		@JsonProperty("protectHueDeg") Double protectHueDeg,
+		@JsonProperty("userGeminiApiKey") String userGeminiApiKey
 ) {
 }
 

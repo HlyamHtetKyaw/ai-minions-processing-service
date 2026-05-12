@@ -68,7 +68,7 @@ public class BalancedSyncPipeline {
 				originalSrt = objectStorageTransferService.download(msg.originalVideoSrtStorageUrl(), workDir);
 			} else {
 				generationStatusPublisher.publishProcessing(jobId, "gen_original_srt");
-				originalSrt = generateAndUploadSrt(jobId, msg.userId(), "original", video, "video", workDir);
+				originalSrt = generateAndUploadSrt(jobId, msg.userId(), "original", video, "video", workDir, msg.userGeminiApiKey());
 			}
 
 			Path voiceSrt;
@@ -76,7 +76,7 @@ public class BalancedSyncPipeline {
 				voiceSrt = objectStorageTransferService.download(msg.voiceOverSrtStorageUrl(), workDir);
 			} else {
 				generationStatusPublisher.publishProcessing(jobId, "gen_voice_srt");
-				voiceSrt = generateAndUploadSrt(jobId, msg.userId(), "voice", voice, "audio", workDir);
+				voiceSrt = generateAndUploadSrt(jobId, msg.userId(), "voice", voice, "audio", workDir, msg.userGeminiApiKey());
 			}
 
 			generationStatusPublisher.publishProcessing(jobId, "parse_srt");
@@ -207,7 +207,8 @@ public class BalancedSyncPipeline {
 			String kind,
 			Path input,
 			String sourceType,
-			Path workDir
+			Path workDir,
+			String userGeminiApiKey
 	) throws Exception {
 		if (userId == null) {
 			throw new IllegalArgumentException("userId is required to generate subtitles");
@@ -277,7 +278,8 @@ public class BalancedSyncPipeline {
 					durationMs,
 					i,
 					targetLanguage,
-					style
+					style,
+					userGeminiApiKey
 			);
 			var cues = aiData.path("result").path("cues");
 			if (cues == null || !cues.isArray()) continue;
