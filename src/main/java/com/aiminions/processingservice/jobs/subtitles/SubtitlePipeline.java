@@ -55,7 +55,38 @@ public class SubtitlePipeline {
 			String sourceType = msg.sourceType() == null ? "audio" : msg.sourceType().trim().toLowerCase(Locale.ROOT);
 			Path normalized = workDir.resolve("normalized.wav");
 
-			if ("video".equals(sourceType)) {
+			boolean viralVoiceSyncedTimeline = matchesSyncedVoiceSubtitles(sourceType, msg);
+			if (viralVoiceSyncedTimeline) {
+				generationStatusPublisher.publishProcessing(jobId, "extract_voice_synced_audio");
+				Path voiceFile = objectStorageTransferService.download(msg.voiceOverStorageUrl(), workDir);
+				long videoMs = ffmpegRunner.getMediaDurationMillis(input);
+				double videoDurSec = Math.max(0.04d, videoMs / 1000.0d);
+				double playbackRate = msg.voiceOverPlaybackRate();
+				if (!Double.isFinite(playbackRate)) {
+					playbackRate = 1d;
+				}
+				playbackRate = Math.max(0.5d, Math.min(5d, playbackRate));
+				String tempo = buildAtempoFilter(playbackRate);
+				List<String> voiceNormalize = new ArrayList<>();
+				voiceNormalize.add("-y");
+				voiceNormalize.add("-i");
+				voiceNormalize.add(voiceFile.toString());
+				voiceNormalize.add("-af");
+				voiceNormalize.add(tempo);
+				voiceNormalize.add("-t");
+				voiceNormalize.add(String.format(Locale.US, "%.4f", videoDurSec));
+				voiceNormalize.add("-vn");
+				voiceNormalize.add("-acodec");
+				voiceNormalize.add("pcm_s16le");
+				voiceNormalize.add("-ar");
+				voiceNormalize.add("44100");
+				voiceNormalize.add("-ac");
+				voiceNormalize.add("1");
+				voiceNormalize.add(normalized.toString());
+				ffmpegRunner.run(voiceNormalize);
+				log.info("Subtitle job {} using viral synced voice timeline (playbackRate={}, videoDurSec={})",
+						jobId, playbackRate, videoDurSec);
+			} else if ("video".equals(sourceType)) {
 				generationStatusPublisher.publishProcessing(jobId, "extract_audio");
 				ffmpegRunner.run(List.of(
 						"-y",
@@ -291,6 +322,34 @@ public class SubtitlePipeline {
 			return "caption_rules_v1";
 		}
 		return s;
+	}
+
+	private static boolean matchesSyncedVoiceSubtitles(String sourceType, SubtitleJobMessage msg) {
+		if (!"video".equals(sourceType)) {
+			return false;
+		}
+		String vu = msg.voiceOverStorageUrl();
+		if (vu == null || vu.isBlank()) {
+			return false;
+		}
+		Double r = msg.voiceOverPlaybackRate();
+		return r != null && Double.isFinite(r) && r > 0;
+	}
+
+	/** Same chaining rules as workspace export ({@code atempo} segments in [0.5, 2.0]). */
+	private static String buildAtempoFilter(double speed) {
+		double remaining = speed;
+		List<String> chain = new ArrayList<>();
+		while (remaining > 2.0d) {
+			chain.add("atempo=2.0");
+			remaining /= 2.0d;
+		}
+		while (remaining < 0.5d) {
+			chain.add("atempo=0.5");
+			remaining *= 2.0d;
+		}
+		chain.add("atempo=" + String.format(Locale.US, "%.4f", remaining));
+		return String.join(",", chain);
 	}
 }
 
