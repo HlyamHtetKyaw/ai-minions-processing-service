@@ -11,6 +11,9 @@ public record SubtitleJobMessage(
 		@JsonProperty("sourceType") String sourceType,
 		@JsonProperty("targetLanguage") String targetLanguage,
 		@JsonProperty("style") String style,
-		@JsonProperty("translatedText") String translatedText) {
+		@JsonProperty("translatedText") String translatedText,
+		@JsonProperty("userGeminiApiKey") String userGeminiApiKey,
+		@JsonProperty("voiceOverStorageUrl") String voiceOverStorageUrl,
+		@JsonProperty("voiceOverPlaybackRate") Double voiceOverPlaybackRate) {
 }
 

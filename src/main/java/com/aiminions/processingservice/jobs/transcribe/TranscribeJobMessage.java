@@ -8,5 +8,6 @@ public record TranscribeJobMessage(
 		@JsonProperty("aiGenerationId") Long aiGenerationId,
 		@JsonProperty("storageUrl") String storageUrl,
 		@JsonProperty("s3Key") String s3Key,
-		@JsonProperty("sourceType") String sourceType) {
+		@JsonProperty("sourceType") String sourceType,
+		@JsonProperty("userGeminiApiKey") String userGeminiApiKey) {
 }

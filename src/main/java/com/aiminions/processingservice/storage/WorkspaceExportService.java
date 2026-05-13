@@ -1233,6 +1233,15 @@ public class WorkspaceExportService {
 
 		String sourceLabel = "am" + trackIndex + "src";
 		parts.add("[" + inputIndex + ":a]asetpts=PTS-STARTPTS[" + sourceLabel + "]");
+		double playbackRate = readNumber(track, "playbackRate", 1d);
+		if (!Double.isFinite(playbackRate)) {
+			playbackRate = 1d;
+		}
+		playbackRate = Math.max(0.5d, Math.min(5d, playbackRate));
+		double combinedTempo = plan.safeSpeed() * playbackRate;
+		if (!Double.isFinite(combinedTempo) || combinedTempo <= 1e-6d || combinedTempo > 512d) {
+			combinedTempo = Math.max(plan.safeSpeed(), 1e-6d);
+		}
 		List<String> chunkLabels = new ArrayList<>();
 		double exportedTrackDuration = 0d;
 		for (int i = 0; i < overlaps.size(); i++) {
@@ -1243,13 +1252,13 @@ public class WorkspaceExportService {
 			if (overlapLen <= 1e-6d) {
 				continue;
 			}
-			exportedTrackDuration += overlapLen / plan.safeSpeed();
+			exportedTrackDuration += overlapLen / combinedTempo;
 			String chunk = "am" + trackIndex + "c" + i;
 			String trimmed = "atrim=start=" + formatDecimal(offsetInTrack)
 					+ ":end=" + formatDecimal(offsetInTrack + overlapLen)
 					+ ",asetpts=PTS-STARTPTS";
-			String speedOp = Math.abs(plan.safeSpeed() - 1d) > 0.0001d
-					? "," + buildAtempoFilter(plan.safeSpeed())
+			String speedOp = Math.abs(combinedTempo - 1d) > 0.0001d
+					? "," + buildAtempoFilter(combinedTempo)
 					: "";
 			parts.add("[" + sourceLabel + "]" + trimmed + speedOp + "[" + chunk + "]");
 			chunkLabels.add("[" + chunk + "]");
@@ -1273,8 +1282,8 @@ public class WorkspaceExportService {
 		if (Math.abs(vol - 1d) > 0.0001d) {
 			ops.add("volume=" + formatDecimal(vol));
 		}
-		double fadeIn = Math.max(0d, readNumber(track, "fadeIn", 0d) / plan.safeSpeed());
-		double fadeOut = Math.max(0d, readNumber(track, "fadeOut", 0d) / plan.safeSpeed());
+		double fadeIn = Math.max(0d, readNumber(track, "fadeIn", 0d) / combinedTempo);
+		double fadeOut = Math.max(0d, readNumber(track, "fadeOut", 0d) / combinedTempo);
 		if (fadeIn > 1e-6d) {
 			ops.add("afade=t=in:st=0:d=" + formatDecimal(Math.min(fadeIn, exportedTrackDuration)));
 		}
