@@ -3,6 +3,7 @@ package com.aiminions.processingservice.jobs.subtitles;
 import com.aiminions.processingservice.config.ProcessingProperties;
 import com.aiminions.processingservice.integration.AiServiceSubtitlesClient;
 import com.aiminions.processingservice.integration.MainServiceWorkerClient;
+import com.aiminions.processingservice.jobs.balancedsync.SrtParser;
 import com.aiminions.processingservice.jobs.transcribe.GenerationStatusPublisher;
 import com.aiminions.processingservice.media.ffmpeg.FfmpegRunner;
 import com.aiminions.processingservice.storage.ObjectStorageTransferService;
@@ -51,15 +52,17 @@ public class SubtitlePipeline {
 			generationStatusPublisher.publishProcessing(jobId, "download");
 			Path input = objectStorageTransferService.download(msg.storageUrl(), workDir);
 			BigDecimal inputMb = bytesToMbSafe(input);
+			long sourceDurationMs = ffmpegRunner.getMediaDurationMillis(input);
 
 			String sourceType = msg.sourceType() == null ? "audio" : msg.sourceType().trim().toLowerCase(Locale.ROOT);
 			Path normalized = workDir.resolve("normalized.wav");
 
 			boolean viralVoiceSyncedTimeline = matchesSyncedVoiceSubtitles(sourceType, msg);
+			boolean originalAudioPlaybackTempo = appliesOriginalAudioPlaybackTempo(sourceType, msg);
 			if (viralVoiceSyncedTimeline) {
 				generationStatusPublisher.publishProcessing(jobId, "extract_voice_synced_audio");
 				Path voiceFile = objectStorageTransferService.download(msg.voiceOverStorageUrl(), workDir);
-				long videoMs = ffmpegRunner.getMediaDurationMillis(input);
+				long videoMs = sourceDurationMs;
 				double videoDurSec = Math.max(0.04d, videoMs / 1000.0d);
 				double playbackRate = msg.voiceOverPlaybackRate();
 				if (!Double.isFinite(playbackRate)) {
@@ -87,19 +90,48 @@ public class SubtitlePipeline {
 				log.info("Subtitle job {} using viral synced voice timeline (playbackRate={}, videoDurSec={})",
 						jobId, playbackRate, videoDurSec);
 			} else if ("video".equals(sourceType)) {
-				generationStatusPublisher.publishProcessing(jobId, "extract_audio");
-				ffmpegRunner.run(List.of(
-						"-y",
-						"-i",
-						input.toString(),
-						"-vn",
-						"-acodec",
-						"pcm_s16le",
-						"-ar",
-						"44100",
-						"-ac",
-						"1",
-						normalized.toString()));
+				double videoDurSec = Math.max(0.04d, sourceDurationMs / 1000.0d);
+				if (originalAudioPlaybackTempo) {
+					generationStatusPublisher.publishProcessing(jobId, "extract_original_audio_tempo");
+					double playbackRate = clampPlaybackRate(msg.voiceOverPlaybackRate());
+					String tempo = buildAtempoFilter(playbackRate);
+					List<String> extractOriginal = new ArrayList<>();
+					extractOriginal.add("-y");
+					extractOriginal.add("-i");
+					extractOriginal.add(input.toString());
+					extractOriginal.add("-vn");
+					extractOriginal.add("-af");
+					extractOriginal.add(tempo);
+					extractOriginal.add("-t");
+					extractOriginal.add(String.format(Locale.US, "%.4f", videoDurSec));
+					extractOriginal.add("-acodec");
+					extractOriginal.add("pcm_s16le");
+					extractOriginal.add("-ar");
+					extractOriginal.add("44100");
+					extractOriginal.add("-ac");
+					extractOriginal.add("1");
+					extractOriginal.add(normalized.toString());
+					ffmpegRunner.run(extractOriginal);
+					log.info(
+							"Subtitle job {} normalized original audio with FE sync rate before AI (playbackRate={}, videoDurSec={})",
+							jobId,
+							playbackRate,
+							videoDurSec);
+				} else {
+					generationStatusPublisher.publishProcessing(jobId, "extract_audio");
+					ffmpegRunner.run(List.of(
+							"-y",
+							"-i",
+							input.toString(),
+							"-vn",
+							"-acodec",
+							"pcm_s16le",
+							"-ar",
+							"44100",
+							"-ac",
+							"1",
+							normalized.toString()));
+				}
 			} else {
 				generationStatusPublisher.publishProcessing(jobId, "normalize_audio");
 				ffmpegRunner.run(List.of(
@@ -177,7 +209,7 @@ public class SubtitlePipeline {
 				}
 			}
 
-			List<SrtFormatter.Cue> merged = mergeCues(allCues);
+			List<SrtFormatter.Cue> merged = mergeCues(allCues, sourceDurationMs);
 
 			String srt = SrtFormatter.toSrt(merged);
 			String translatedText = msg.translatedText() == null ? "" : msg.translatedText().trim();
@@ -208,6 +240,12 @@ public class SubtitlePipeline {
 				throw new IllegalStateException("No subtitle cues were generated");
 			}
 
+			List<SrtFormatter.Cue> publishedCues = resolveNonOverlappingTimeline(fromSrtParserCues(SrtParser.parse(srt)), sourceDurationMs);
+			if (publishedCues.isEmpty()) {
+				throw new IllegalStateException("No subtitle cues after timeline normalization");
+			}
+			srt = SrtFormatter.toSrt(publishedCues);
+
 			generationStatusPublisher.publishProcessing(jobId, "upload_srt");
 			Path out = workDir.resolve("subtitles.srt");
 			Files.writeString(out, srt);
@@ -224,7 +262,7 @@ public class SubtitlePipeline {
 			outputDataNode.put("style", style);
 			outputDataNode.put("srtKey", stored.key());
 			outputDataNode.put("srtStorageUrl", stored.storageUrl());
-			outputDataNode.put("cues", merged.size());
+			outputDataNode.put("cues", publishedCues.size());
 
 			String outputData = objectMapper.writeValueAsString(outputDataNode);
 			generationStatusPublisher.publishCompleted(jobId, outputData);
@@ -263,33 +301,83 @@ public class SubtitlePipeline {
 		generationStatusPublisher.publishFailed(jobId, err);
 	}
 
-	private static List<SrtFormatter.Cue> mergeCues(List<SrtFormatter.Cue> in) {
-		if (in == null || in.isEmpty()) return List.of();
+	private static List<SrtFormatter.Cue> mergeCues(List<SrtFormatter.Cue> in, long timelineMaxMs) {
+		if (in == null || in.isEmpty()) {
+			return List.of();
+		}
 		List<SrtFormatter.Cue> items = in.stream()
 				.filter(c -> c != null && c.text() != null && !c.text().trim().isBlank())
 				.sorted(Comparator.comparingLong(SrtFormatter.Cue::startMs).thenComparingLong(SrtFormatter.Cue::endMs))
 				.toList();
 
-		List<SrtFormatter.Cue> out = new ArrayList<>(items.size());
-		long lastEnd = -1;
-		String lastText = null;
+		List<SrtFormatter.Cue> deduped = new ArrayList<>(items.size());
 		for (SrtFormatter.Cue c : items) {
-			long start = Math.max(0, c.startMs());
-			long end = Math.max(start + 300, c.endMs());
 			String text = c.text().trim();
-			if (lastText != null && text.equals(lastText) && Math.abs(start - lastEnd) <= 300) {
-				// likely overlap duplicate from chunk boundary
-				continue;
-			}
-			if (lastEnd >= 0 && start < lastEnd) {
-				start = lastEnd;
-				if (end <= start) {
-					end = start + 500;
+			if (!deduped.isEmpty()) {
+				SrtFormatter.Cue prev = deduped.get(deduped.size() - 1);
+				if (text.equals(prev.text().trim()) && Math.abs(c.startMs() - prev.endMs()) <= 300) {
+					continue;
 				}
 			}
-			out.add(new SrtFormatter.Cue(start, end, text));
-			lastEnd = end;
-			lastText = text;
+			deduped.add(c);
+		}
+		return resolveNonOverlappingTimeline(deduped, timelineMaxMs);
+	}
+
+	/**
+	 * Converts parser cues; used after AI refine may re-introduce overlaps.
+	 */
+	private static List<SrtFormatter.Cue> fromSrtParserCues(List<SrtParser.Cue> parsed) {
+		if (parsed == null || parsed.isEmpty()) {
+			return List.of();
+		}
+		List<SrtFormatter.Cue> out = new ArrayList<>(parsed.size());
+		for (SrtParser.Cue c : parsed) {
+			if (c == null || c.text() == null || c.text().trim().isBlank()) {
+				continue;
+			}
+			out.add(new SrtFormatter.Cue(c.startMs(), c.endMs(), c.text()));
+		}
+		return out;
+	}
+
+	/**
+	 * Clips each cue so it ends before the next cue starts (models often emit one block spanning minutes).
+	 */
+	private static List<SrtFormatter.Cue> resolveNonOverlappingTimeline(List<SrtFormatter.Cue> sorted, long timelineMaxMs) {
+		long gapMs = 50L;
+		long minDisplayMs = 320L;
+		if (sorted.isEmpty()) {
+			return List.of();
+		}
+		List<SrtFormatter.Cue> m = new ArrayList<>(sorted);
+		m.sort(Comparator.comparingLong(SrtFormatter.Cue::startMs).thenComparingLong(SrtFormatter.Cue::endMs));
+
+		long capEnd = timelineMaxMs > 0 ? timelineMaxMs : Long.MAX_VALUE;
+		List<SrtFormatter.Cue> out = new ArrayList<>(m.size());
+		long prevEnd = -gapMs;
+
+		for (int i = 0; i < m.size(); i++) {
+			SrtFormatter.Cue c = m.get(i);
+			String text = c.text().trim();
+			long rawNextStart = i + 1 < m.size() ? m.get(i + 1).startMs() : Long.MAX_VALUE;
+
+			long st = Math.max(0L, Math.max(c.startMs(), prevEnd + gapMs));
+			long maxEndByNext = rawNextStart - gapMs;
+			long maxEndTotal = Math.min(maxEndByNext, capEnd);
+
+			long en = Math.max(c.endMs(), st + minDisplayMs);
+			en = Math.min(en, maxEndTotal);
+
+			if (en < st + minDisplayMs) {
+				st = Math.max(prevEnd + gapMs, Math.min(st, Math.max(0L, maxEndTotal - minDisplayMs)));
+				en = Math.min(maxEndTotal, st + minDisplayMs);
+			}
+			if (en <= st || st >= capEnd) {
+				continue;
+			}
+			out.add(new SrtFormatter.Cue(st, en, text));
+			prevEnd = en;
 		}
 		return out;
 	}
@@ -334,6 +422,30 @@ public class SubtitlePipeline {
 		}
 		Double r = msg.voiceOverPlaybackRate();
 		return r != null && Double.isFinite(r) && r > 0;
+	}
+
+	/**
+	 * FE sync rate (e.g. 0.9×) applied to extracted original soundtrack so AI timings match what the user aligned.
+	 */
+	private static boolean appliesOriginalAudioPlaybackTempo(String sourceType, SubtitleJobMessage msg) {
+		if (!"video".equals(sourceType)) {
+			return false;
+		}
+		String vu = msg.voiceOverStorageUrl();
+		if (vu != null && !vu.isBlank()) {
+			return false;
+		}
+		Double r = msg.voiceOverPlaybackRate();
+		if (r == null || !Double.isFinite(r) || r <= 0) {
+			return false;
+		}
+		double clamped = clampPlaybackRate(r);
+		return Math.abs(clamped - 1d) > 1e-4d;
+	}
+
+	private static double clampPlaybackRate(Double r) {
+		double v = r != null && Double.isFinite(r) ? r : 1d;
+		return Math.max(0.5d, Math.min(5d, v));
 	}
 
 	/** Same chaining rules as workspace export ({@code atempo} segments in [0.5, 2.0]). */
