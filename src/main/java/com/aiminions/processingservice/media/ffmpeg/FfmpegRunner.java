@@ -69,6 +69,7 @@ public class FfmpegRunner {
 		if (r.exitCode() != 0) {
 			String out = r.output();
 			String tail = out.length() > 4000 ? out.substring(out.length() - 4000) : out;
+			log.error("ffmpeg FAILED exitCode={} output=\n{}", r.exitCode(), tail);
 			throw new IllegalStateException("ffmpeg exited with " + r.exitCode() + ": " + tail);
 		}
 	}
@@ -78,6 +79,7 @@ public class FfmpegRunner {
 		if (r.exitCode() != 0) {
 			String out = r.output();
 			String tail = out.length() > 4000 ? out.substring(out.length() - 4000) : out;
+			log.error("ffmpeg FAILED exitCode={} output=\n{}", r.exitCode(), tail);
 			throw new IllegalStateException("ffmpeg exited with " + r.exitCode() + ": " + tail);
 		}
 	}
@@ -92,7 +94,7 @@ public class FfmpegRunner {
 		List<String> cmd = new ArrayList<>();
 		cmd.add(processingProperties.getFfmpegBinary());
 		cmd.addAll(args);
-		log.debug("ffmpeg {}", String.join(" ", cmd));
+		log.info("[ffmpeg][start] command: {}", String.join(" ", cmd));
 		ProcessBuilder pb = new ProcessBuilder(cmd);
 		if (env != null && !env.isEmpty()) {
 			pb.environment().putAll(env);
@@ -111,17 +113,25 @@ public class FfmpegRunner {
 								+ "(e.g. from https://www.gyan.dev/ffmpeg/builds/), add it to your allowlist, or unblock the file in Properties. "
 								+ "Currently configured: "
 								+ bin,
-						e);
+					e);
 			}
+			log.error("[ffmpeg][launch-failed] {}", e.getMessage(), e);
 			throw e;
 		}
 		String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
 		boolean finished = p.waitFor(timeout, unit);
 		if (!finished) {
 			p.destroyForcibly();
+			log.error("[ffmpeg][timeout] command timed out after {} {}: {}", timeout, unit, String.join(" ", cmd));
 			throw new IllegalStateException("ffmpeg timed out");
 		}
-		return new RunResult(p.exitValue(), out);
+		int exit = p.exitValue();
+		if (exit == 0) {
+			log.info("[ffmpeg][done] exitCode=0 output({} chars):\n{}", out.length(), truncate(out, 3000));
+		} else {
+			log.error("[ffmpeg][failed] exitCode={} output({} chars):\n{}", exit, out.length(), truncate(out, 6000));
+		}
+		return new RunResult(exit, out);
 	}
 
 	public record RunResult(int exitCode, String output) {

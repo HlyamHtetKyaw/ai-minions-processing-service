@@ -155,15 +155,34 @@ public class RedisStreamJobConsumerService {
                 attempts,
                 dlqStream);
         if (!jobId.isBlank() && Boolean.FALSE.equals(redis.opsForValue().setIfAbsent(doneKey, "in-progress", Duration.ofHours(2)))) {
-            log.info(
-                    "[redis-stream][dedupe] stream={} group={} recordId={} jobType={} jobId={} action=ack_duplicate",
-                    stream,
-                    group,
-                    record.getId() != null ? record.getId().getValue() : "null",
-                    jobType,
-                    jobId);
-            redis.opsForStream().acknowledge(stream, group, record.getId());
-            return;
+            // Key already exists — check what value it holds.
+            // "in-progress" means the service crashed while processing this job last time → stale key, must reprocess.
+            // Any other value (a real recordId) means the job genuinely completed → safe to deduplicate.
+            String existingValue = redis.opsForValue().get(doneKey);
+            if ("in-progress".equals(existingValue)) {
+                log.warn(
+                        "[redis-stream][crash-resume] stream={} group={} recordId={} jobType={} jobId={} " +
+                        "action=reprocess (doneKey was in-progress from previous crash)",
+                        stream,
+                        group,
+                        record.getId() != null ? record.getId().getValue() : "null",
+                        jobType,
+                        jobId);
+                // Clear the stale key so setIfAbsent will succeed and we can reprocess.
+                redis.delete(doneKey);
+                // Re-set as "in-progress" for this attempt.
+                redis.opsForValue().set(doneKey, "in-progress", Duration.ofHours(2));
+            } else {
+                log.info(
+                        "[redis-stream][dedupe] stream={} group={} recordId={} jobType={} jobId={} action=ack_duplicate",
+                        stream,
+                        group,
+                        record.getId() != null ? record.getId().getValue() : "null",
+                        jobType,
+                        jobId);
+                redis.opsForStream().acknowledge(stream, group, record.getId());
+                return;
+            }
         }
         try {
             handler.accept(payload);
@@ -247,14 +266,45 @@ public class RedisStreamJobConsumerService {
 
     private void reclaimPending(String stream, String group, String consumerName) {
         try {
-            PendingMessages pending = redis.opsForStream().pending(stream, org.springframework.data.redis.connection.stream.Consumer.from(group, consumerName), Range.unbounded(), 50L);
-            if (pending == null || pending.isEmpty()) {
+            // First, get the group-level summary to find which consumers have pending messages.
+            // We cannot use the consumer-specific variant here because on restart the new thread IDs
+            // don't match the old consumer names, so the current consumer has 0 pending entries.
+            org.springframework.data.redis.connection.stream.PendingMessagesSummary summary =
+                    redis.opsForStream().pending(stream, group);
+            if (summary == null || summary.getTotalPendingMessages() == 0) {
                 return;
             }
-            List<RecordId> ids = pending.stream().map(PendingMessage::getId).toList();
-            if (!ids.isEmpty()) {
-                redis.opsForStream().claim(stream, group, consumerName, Duration.ofMillis(Math.max(1000, props.getRedisStreamClaimIdleMs())), ids.toArray(new RecordId[0]));
-            }
+            long claimIdleMs = Math.max(1000, props.getRedisStreamClaimIdleMs());
+            // Iterate every consumer that has pending messages and claim the idle ones.
+            summary.getPendingMessagesPerConsumer().forEach((staleConsumer, count) -> {
+                if (count == null || count == 0) return;
+                try {
+                    PendingMessages pending = redis.opsForStream().pending(
+                            stream,
+                            org.springframework.data.redis.connection.stream.Consumer.from(group, staleConsumer),
+                            Range.unbounded(),
+                            50L);
+                    if (pending == null || pending.isEmpty()) return;
+                    List<RecordId> toClaim = pending.stream()
+                            .filter(pm -> {
+                                java.time.Duration idle = pm.getElapsedTimeSinceLastDelivery();
+                                return idle != null && idle.toMillis() >= claimIdleMs;
+                            })
+                            .map(PendingMessage::getId)
+                            .toList();
+                    if (!toClaim.isEmpty()) {
+                        log.info(
+                                "[redis-stream][reclaim] stream={} group={} fromConsumer={} toConsumer={} ids={}",
+                                stream, group, staleConsumer, consumerName, toClaim);
+                        redis.opsForStream().claim(stream, group, consumerName,
+                                Duration.ofMillis(claimIdleMs),
+                                toClaim.toArray(new RecordId[0]));
+                    }
+                } catch (Exception ex) {
+                    log.warn("[redis-stream][reclaim] Failed to reclaim from consumer={} stream={}: {}",
+                            staleConsumer, stream, ex.toString());
+                }
+            });
         } catch (Exception ex) {
             log.warn("Pending reclaim failed stream={} group={}: {}", stream, group, ex.toString());
         }
