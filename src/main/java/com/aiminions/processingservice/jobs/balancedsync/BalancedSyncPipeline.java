@@ -302,19 +302,23 @@ public class BalancedSyncPipeline {
 		int crf = Math.max(10, Math.min(35, processingProperties.getWorkspaceExportCrf()));
 
 		String vChain = "setpts=" + fmt(1d / rates.videoRate()) + "*PTS";
+		String srcAudioChain = buildAtempoFilter(rates.videoRate());
+		String voiceChain = buildAtempoFilter(rates.voiceRate());
 		if (rates.targetDurationSec() > 0) {
-			vChain = vChain + ",trim=duration=" + fmt(rates.targetDurationSec()) + ",setpts=PTS-STARTPTS";
-		}
-
-		String aChain = buildAtempoFilter(rates.voiceRate());
-		if (rates.targetDurationSec() > 0) {
-			aChain = aChain
-					+ ",apad=pad_dur=" + fmt(rates.targetDurationSec())
-					+ ",atrim=duration=" + fmt(rates.targetDurationSec())
+			String dur = fmt(rates.targetDurationSec());
+			vChain = vChain + ",trim=duration=" + dur + ",setpts=PTS-STARTPTS";
+			srcAudioChain = srcAudioChain
+					+ ",apad=pad_dur=" + dur
+					+ ",atrim=duration=" + dur
+					+ ",asetpts=PTS-STARTPTS";
+			voiceChain = voiceChain
+					+ ",apad=pad_dur=" + dur
+					+ ",atrim=duration=" + dur
 					+ ",asetpts=PTS-STARTPTS";
 		}
 
-		String filter = "[0:v]" + vChain + "[v];[1:a]" + aChain + "[a]";
+		// pre-video includes retimed source audio so generateAndUploadSrt can extract it (-vn).
+		String filter = "[0:v]" + vChain + "[v];[0:a]" + srcAudioChain + "[a0];[1:a]" + voiceChain + "[a]";
 
 		List<String> args = new ArrayList<>();
 		args.add("-y");
@@ -334,7 +338,8 @@ public class BalancedSyncPipeline {
 		args.add(filter);
 		args.add("-map");
 		args.add("[v]");
-		args.add("-an");
+		args.add("-map");
+		args.add("[a0]");
 		args.add("-c:v");
 		args.add("libx264");
 		args.add("-preset");
@@ -343,6 +348,8 @@ public class BalancedSyncPipeline {
 		args.add(String.valueOf(crf));
 		args.add("-pix_fmt");
 		args.add("yuv420p");
+		args.add("-c:a");
+		args.add("aac");
 		args.add(preVideo.toString());
 		args.add("-map");
 		args.add("[a]");
