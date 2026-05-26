@@ -52,6 +52,8 @@ public class BalancedSyncPipeline {
 	private static final Pattern DURATION = Pattern.compile("Duration:\\s*(\\d+):(\\d+):(\\d+(?:\\.\\d+)?)");
 	private static final long ANCHOR_GAP_MS = 1500L;
 	private static final long SUBTITLES_CHUNK_SECONDS = 25L;
+	private static final double UNIFORM_PREPASS_RATIO_HIGH = 1.35d;
+	private static final double UNIFORM_PREPASS_RATIO_LOW = 0.74d;
 
 	public void run(BalancedSyncJobMessage msg) {
 		long jobId = msg.jobId() != null ? msg.jobId() : msg.aiGenerationId();
@@ -63,20 +65,50 @@ public class BalancedSyncPipeline {
 			Path video = objectStorageTransferService.download(require(msg.videoStorageUrl(), "videoStorageUrl"), workDir);
 			Path voice = objectStorageTransferService.download(require(msg.voiceStorageUrl(), "voiceStorageUrl"), workDir);
 
+			long videoMs = ffmpegRunner.getMediaDurationMillis(video);
+			long voiceMs = ffmpegRunner.getMediaDurationMillis(voice);
+
+			Path workVideo = video;
+			Path workVoice = voice;
+			boolean uniformPrepassApplied = false;
+			double uniformVideoRate = 1d;
+			double uniformVoiceRate = 1d;
+
+			if (needsUniformPrepass(videoMs, voiceMs)) {
+				uniformPrepassApplied = true;
+				generationStatusPublisher.publishProcessing(jobId, "uniform_preprocess");
+				SolvedRates rates = resolveRates(msg, videoMs, voiceMs);
+				double ratio = voiceMs / (double) Math.max(1L, videoMs);
+				log.info(
+						"balanced-sync job {} uniform pre-pass videoRate={} voiceRate={} (ratio was {})",
+						jobId,
+						fmt(rates.videoRate()),
+						fmt(rates.voiceRate()),
+						fmt(ratio));
+				UniformPreprocessResult pre = runUniformPreprocess(video, voice, workDir, rates);
+				workVideo = pre.preVideo();
+				workVoice = pre.preVoice();
+				uniformVideoRate = pre.videoRate();
+				uniformVoiceRate = pre.voiceRate();
+			}
+
+			boolean forceRegenSrt = uniformPrepassApplied;
 			Path originalSrt;
-			if (msg.originalVideoSrtStorageUrl() != null && !msg.originalVideoSrtStorageUrl().isBlank()) {
+			if (!forceRegenSrt && hasUploadedSrt(msg.originalVideoSrtStorageUrl())) {
 				originalSrt = objectStorageTransferService.download(msg.originalVideoSrtStorageUrl(), workDir);
 			} else {
 				generationStatusPublisher.publishProcessing(jobId, "gen_original_srt");
-				originalSrt = generateAndUploadSrt(jobId, msg.userId(), "original", video, "video", workDir, msg.userGeminiApiKey());
+				originalSrt = generateAndUploadSrt(
+						jobId, msg.userId(), "original", workVideo, "video", workDir, msg.userGeminiApiKey());
 			}
 
 			Path voiceSrt;
-			if (msg.voiceOverSrtStorageUrl() != null && !msg.voiceOverSrtStorageUrl().isBlank()) {
+			if (!forceRegenSrt && hasUploadedSrt(msg.voiceOverSrtStorageUrl())) {
 				voiceSrt = objectStorageTransferService.download(msg.voiceOverSrtStorageUrl(), workDir);
 			} else {
 				generationStatusPublisher.publishProcessing(jobId, "gen_voice_srt");
-				voiceSrt = generateAndUploadSrt(jobId, msg.userId(), "voice", voice, "audio", workDir, msg.userGeminiApiKey());
+				voiceSrt = generateAndUploadSrt(
+						jobId, msg.userId(), "voice", workVoice, "audio", workDir, msg.userGeminiApiKey());
 			}
 
 			generationStatusPublisher.publishProcessing(jobId, "parse_srt");
@@ -84,7 +116,7 @@ public class BalancedSyncPipeline {
 			String voiceSrtText = Files.readString(voiceSrt, StandardCharsets.UTF_8);
 			List<SrtParser.Cue> originalCues = SrtParser.parse(originalSrtText);
 			List<SrtParser.Cue> voiceCues = SrtParser.parse(voiceSrtText);
-			long trueVoiceDurationMs = ffmpegRunner.getMediaDurationMillis(voice);
+			long trueVoiceDurationMs = ffmpegRunner.getMediaDurationMillis(workVoice);
 			long leadPadMs = Math.max(0L, firstStartMs(voiceCues) - firstStartMs(originalCues));
 			log.info(
 					"balanced-sync job {} voice physical duration {} ms (ffprobe), leadPadMs {} ms",
@@ -98,7 +130,7 @@ public class BalancedSyncPipeline {
 
 			Path out = workDir.resolve("balanced-" + System.currentTimeMillis() + ".mp4");
 			generationStatusPublisher.publishProcessing(jobId, "ffmpeg_segments");
-			runAnchorSyncFfmpeg(video, voice, out, workDir, plan, msg.protectFlip(), msg.protectHueDeg(), leadPadMs);
+			runAnchorSyncFfmpeg(workVideo, workVoice, out, workDir, plan, msg.protectFlip(), msg.protectHueDeg(), leadPadMs);
 
 			generationStatusPublisher.publishProcessing(jobId, "upload");
 			String keyHint = "video-editor/" + (msg.userId() == null ? "unknown" : msg.userId()) + "/balanced-sync/"
@@ -114,6 +146,11 @@ public class BalancedSyncPipeline {
 			result.put("s3Key", stored.key());
 			result.put("originalChunkCount", plan.originalChunkCount());
 			result.put("voiceChunkCount", plan.voiceChunkCount());
+			if (uniformPrepassApplied) {
+				result.put("uniformPrepassApplied", true);
+				result.put("videoRate", round6(uniformVideoRate));
+				result.put("voiceRate", round6(uniformVoiceRate));
+			}
 
 			String outputJson = objectMapper.writeValueAsString(output);
 			generationStatusPublisher.publishCompleted(jobId, outputJson);
@@ -207,6 +244,122 @@ public class BalancedSyncPipeline {
 	}
 
 	private record SolvedRates(double videoRate, double voiceRate, double targetDurationSec) {}
+
+	private record UniformPreprocessResult(Path preVideo, Path preVoice, double videoRate, double voiceRate) {}
+
+	static boolean needsUniformPrepass(long videoMs, long voiceMs) {
+		if (videoMs <= 0 || voiceMs <= 0) {
+			return false;
+		}
+		double ratio = voiceMs / (double) videoMs;
+		return ratio > UNIFORM_PREPASS_RATIO_HIGH || ratio < UNIFORM_PREPASS_RATIO_LOW;
+	}
+
+	private static boolean hasUploadedSrt(String storageUrl) {
+		return storageUrl != null && !storageUrl.isBlank();
+	}
+
+	private SolvedRates resolveRates(BalancedSyncJobMessage msg, long videoMs, long voiceMs) {
+		if (videoMs > 0 && voiceMs > 0) {
+			double vd = videoMs / 1000d;
+			double ad = voiceMs / 1000d;
+			SolvedRates solved = solveRates(vd, ad);
+			double videoRate = (msg.videoRate() != null && Double.isFinite(msg.videoRate()) && msg.videoRate() > 0)
+					? safeRate(msg.videoRate())
+					: solved.videoRate();
+			double voiceRate = (msg.voiceRate() != null && Double.isFinite(msg.voiceRate()) && msg.voiceRate() > 0)
+					? safeRate(msg.voiceRate())
+					: solved.voiceRate();
+			double targetDurationSec = (msg.targetDurationSec() != null && msg.targetDurationSec() > 0)
+					? safeDuration(msg.targetDurationSec())
+					: solved.targetDurationSec();
+			return new SolvedRates(videoRate, voiceRate, targetDurationSec);
+		}
+		return new SolvedRates(
+				safeRate(msg.videoRate()),
+				safeRate(msg.voiceRate()),
+				safeDuration(msg.targetDurationSec()));
+	}
+
+	/**
+	 * Global balanced retime: one ffmpeg pass producing separate pre-video and pre-voice intermediates
+	 * for subsequent SRT generation and anchor-sync refinement.
+	 */
+	private UniformPreprocessResult runUniformPreprocess(
+			Path video,
+			Path voice,
+			Path workDir,
+			SolvedRates rates
+	) throws Exception {
+		Path preVideo = workDir.resolve("pre-video.mp4");
+		Path preVoice = workDir.resolve("pre-voice.m4a");
+
+		int threads = Math.max(0, processingProperties.getWorkspaceExportFfmpegThreads());
+		String preset = processingProperties.getWorkspaceExportPreset();
+		if (preset == null || preset.isBlank()) {
+			preset = "veryfast";
+		}
+		int crf = Math.max(10, Math.min(35, processingProperties.getWorkspaceExportCrf()));
+
+		String vChain = "setpts=" + fmt(1d / rates.videoRate()) + "*PTS";
+		String srcAudioChain = buildAtempoFilter(rates.videoRate());
+		String voiceChain = buildAtempoFilter(rates.voiceRate());
+		if (rates.targetDurationSec() > 0) {
+			String dur = fmt(rates.targetDurationSec());
+			vChain = vChain + ",trim=duration=" + dur + ",setpts=PTS-STARTPTS";
+			srcAudioChain = srcAudioChain
+					+ ",apad=pad_dur=" + dur
+					+ ",atrim=duration=" + dur
+					+ ",asetpts=PTS-STARTPTS";
+			voiceChain = voiceChain
+					+ ",apad=pad_dur=" + dur
+					+ ",atrim=duration=" + dur
+					+ ",asetpts=PTS-STARTPTS";
+		}
+
+		// pre-video includes retimed source audio so generateAndUploadSrt can extract it (-vn).
+		String filter = "[0:v]" + vChain + "[v];[0:a]" + srcAudioChain + "[a0];[1:a]" + voiceChain + "[a]";
+
+		List<String> args = new ArrayList<>();
+		args.add("-y");
+		if (threads > 0) {
+			args.add("-threads");
+			args.add(String.valueOf(threads));
+			args.add("-filter_threads");
+			args.add(String.valueOf(threads));
+			args.add("-filter_complex_threads");
+			args.add(String.valueOf(threads));
+		}
+		args.add("-i");
+		args.add(video.toString());
+		args.add("-i");
+		args.add(voice.toString());
+		args.add("-filter_complex");
+		args.add(filter);
+		args.add("-map");
+		args.add("[v]");
+		args.add("-map");
+		args.add("[a0]");
+		args.add("-c:v");
+		args.add("libx264");
+		args.add("-preset");
+		args.add(preset.trim());
+		args.add("-crf");
+		args.add(String.valueOf(crf));
+		args.add("-pix_fmt");
+		args.add("yuv420p");
+		args.add("-c:a");
+		args.add("aac");
+		args.add(preVideo.toString());
+		args.add("-map");
+		args.add("[a]");
+		args.add("-c:a");
+		args.add("aac");
+		args.add(preVoice.toString());
+
+		ffmpegRunner.run(args);
+		return new UniformPreprocessResult(preVideo, preVoice, rates.videoRate(), rates.voiceRate());
+	}
 
 	private Path generateAndUploadSrt(
 			long balancedSyncJobId,
@@ -350,10 +503,16 @@ public class BalancedSyncPipeline {
 				vf.add("tpad=start_mode=clone:start_duration=" + fmt(leadPadMs / 1000d));
 			}
 			if (sp.kind() == SegmentKind.TALK) {
-				vf.add("setpts=" + fmt(sp.setptsMultiplier()) + "*PTS");
-				if (sp.setptsMultiplier() > 2.0d) {
-					// Slow-motion: add interpolation for smoothness.
-					vf.add("minterpolate=fps=60");
+				double mul = sp.setptsMultiplier();
+				vf.add("setpts=" + fmt(mul) + "*PTS");
+				// Do not use minterpolate here: at high multipliers (e.g. 4x slow-mo) it can take
+				// tens of minutes per segment on small VPS instances. setpts alone is fast and
+				// preserves sync; output may look choppier at extreme slowdown.
+				if (mul > 2.0d) {
+					log.info(
+							"balanced-sync seg {}: extreme slowdown multiplier {} (skipping minterpolate for speed)",
+							i,
+							fmt(mul));
 				}
 			}
 			if (Boolean.TRUE.equals(protectFlip)) {
@@ -568,67 +727,5 @@ public class BalancedSyncPipeline {
 		return String.join(",", parts);
 	}
 
-	private static List<String> buildFfmpegArgs(
-			Path video,
-			Path voice,
-			Path out,
-			double videoRate,
-			double voiceRate,
-			double targetDurationSec,
-			Boolean protectFlip,
-			Double protectHueDeg
-	) {
-		List<String> args = new ArrayList<>();
-		args.add("-y");
-		args.add("-i");
-		args.add(video.toString());
-		args.add("-i");
-		args.add(voice.toString());
-
-		List<String> vOps = new ArrayList<>();
-		vOps.add("setpts=" + fmt(1d / videoRate) + "*PTS");
-		if (Boolean.TRUE.equals(protectFlip)) {
-			vOps.add("hflip");
-		}
-		if (protectHueDeg != null && Double.isFinite(protectHueDeg) && Math.abs(protectHueDeg) > 0.0001d) {
-			vOps.add("hue=h=" + fmt(protectHueDeg));
-		}
-
-		String vChain = String.join(",", vOps);
-		if (targetDurationSec > 0) {
-			vChain = vChain + ",trim=duration=" + fmt(targetDurationSec) + ",setpts=PTS-STARTPTS";
-		}
-
-		String aChain = buildAtempoFilter(voiceRate);
-		if (targetDurationSec > 0) {
-			// Guarantee audio matches video duration exactly (pad with silence if needed, trim if longer).
-			aChain = aChain
-					+ ",apad=pad_dur=" + fmt(targetDurationSec)
-					+ ",atrim=duration=" + fmt(targetDurationSec)
-					+ ",asetpts=PTS-STARTPTS";
-		}
-
-		String filter = "[0:v]" + vChain + "[v];" +
-				"[1:a]" + aChain + "[a]";
-
-		args.add("-filter_complex");
-		args.add(filter);
-		args.add("-map");
-		args.add("[v]");
-		args.add("-map");
-		args.add("[a]");
-		args.add("-c:v");
-		args.add("libx264");
-		args.add("-preset");
-		args.add("veryfast");
-		args.add("-crf");
-		args.add("23");
-		args.add("-c:a");
-		args.add("aac");
-		args.add("-movflags");
-		args.add("+faststart");
-		args.add(out.toString());
-		return args;
-	}
 }
 
