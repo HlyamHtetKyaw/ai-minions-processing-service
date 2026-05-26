@@ -50,10 +50,25 @@ public class WorkspaceExportService {
 	 * ASS {@code BackColour} for black at UI opacity 0–100 (%). Format {@code &HAABBGGRR}; {@code AA} is 00=opaque, FF=transparent.
 	 */
 	private static String assBackColourBlackFromOpacityPercent(int opacityPercent) {
+		return assBackColourFromWebHexAndOpacityPercent("#000000", opacityPercent);
+	}
+
+	/** ASS {@code BackColour} from CSS hex and UI opacity 0–100 (%). Format {@code &HAABBGGRR}. */
+	private static String assBackColourFromWebHexAndOpacityPercent(String rawHex, int opacityPercent) {
+		String hex = rawHex == null ? "000000" : rawHex.trim();
+		if (hex.startsWith("#")) {
+			hex = hex.substring(1);
+		}
+		if (!hex.matches("(?i)[0-9a-f]{6}")) {
+			hex = "000000";
+		}
 		int o = Math.max(0, Math.min(100, opacityPercent));
 		int aa = (int) Math.round(255.0 * (1.0 - o / 100.0));
 		aa = Math.max(0, Math.min(255, aa));
-		return String.format(Locale.ROOT, "&H%02X000000", aa);
+		String rr = hex.substring(0, 2);
+		String gg = hex.substring(2, 4);
+		String bb = hex.substring(4, 6);
+		return String.format(Locale.ROOT, "&H%02X%s%s%s", aa, bb, gg, rr);
 	}
 
 	/**
@@ -749,7 +764,8 @@ public class WorkspaceExportService {
 			int fontSize = resolveSubtitleBurnFontSize(payload, videoW, videoH);
 			int marginV = Math.max(0, Math.min(300, processingProperties.getSubtitlesMarginV()));
 			int bgOpacity = readInt(payload, "subtitlesBackgroundOpacity", 65);
-			String backColour = assBackColourBlackFromOpacityPercent(bgOpacity);
+			String bgHex = readText(payload, "subtitlesBackgroundColor", "#000000");
+			String backColour = assBackColourFromWebHexAndOpacityPercent(bgHex, bgOpacity);
 			int boxOutline = subtitleBoxOutlinePx(fontSize);
 			boolean captionBox = bgOpacity > 0;
 			String primaryAss = assOpaquePrimaryFromWebHex(readText(payload, "subtitlesPrimaryColor", "#FFFFFF"));
@@ -815,7 +831,8 @@ public class WorkspaceExportService {
 			int fontSize = resolveSubtitleBurnFontSize(payload, videoW, videoH);
 			int marginV = Math.max(0, Math.min(300, processingProperties.getSubtitlesMarginV()));
 			int bgOpacity = readInt(payload, "subtitlesBackgroundOpacity", 65);
-			String backColour = assBackColourBlackFromOpacityPercent(bgOpacity);
+			String bgHex = readText(payload, "subtitlesBackgroundColor", "#000000");
+			String backColour = assBackColourFromWebHexAndOpacityPercent(bgHex, bgOpacity);
 			int boxOutline = subtitleBoxOutlinePx(fontSize);
 			boolean captionBox = bgOpacity > 0;
 			String primaryAss = assOpaquePrimaryFromWebHex(readText(payload, "subtitlesPrimaryColor", "#FFFFFF"));
@@ -949,8 +966,19 @@ public class WorkspaceExportService {
 				double opacity = Math.max(0d, Math.min(1d, readNumber(layer, "opacity", 100d) / 100d));
 				int alpha = toAssAlpha(opacity);
 				String color = toAssPrimaryColor(readText(layer, "color", "#FFFFFF"));
-				String tags = "{\\an5\\pos(" + posX + "," + posY + ")\\fs" + fontSize + "\\1c" + color
-						+ "\\1a&H" + String.format(Locale.US, "%02X", alpha) + "&}";
+				int bgOpacity = readInt(layer, "backgroundOpacity", 0);
+				StringBuilder tagBuilder = new StringBuilder();
+				tagBuilder.append("{\\an5\\pos(").append(posX).append(',').append(posY).append(")\\fs")
+						.append(fontSize).append("\\1c").append(color).append("\\1a&H")
+						.append(String.format(Locale.US, "%02X", alpha)).append("&");
+				if (bgOpacity > 0) {
+					String bgHex = readText(layer, "backgroundColor", "#000000");
+					String backColour = assBackColourFromWebHexAndOpacityPercent(bgHex, bgOpacity);
+					int boxOutline = subtitleBoxOutlinePx(fontSize);
+					tagBuilder.append("\\bord").append(boxOutline).append("\\3c").append(backColour).append("\\shad0");
+				}
+				tagBuilder.append('}');
+				String tags = tagBuilder.toString();
 				String text = escapeAssDialogueText(content);
 				for (double[] s : plan.segments()) {
 					double cs = Math.max(layerStart, s[0]);
